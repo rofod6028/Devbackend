@@ -1,0 +1,6 @@
+node_modules/
+.env
+onedrive_tokens.json
+inventory_logs.json
+*.log
+.DS_Store

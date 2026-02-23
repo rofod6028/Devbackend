@@ -20,7 +20,7 @@ const CONFIG = {
   clientId: '5454a185-bc04-4e74-9597-e2305dd67d36',
   clientSecret: 'Se98Q~SelMSaSB.Euko66Qqcny7wgcpuWy10ZbB0',
   redirectUri: 'http://localhost:5000/callback',
-  authCode: 'M.C522_SN1.2.U.d4292a30-02ff-78ae-c49a-5624916cab18', // ⚠️ 만료되면 재발급 필요
+  authCode: 'M.C522_BL2.2.U.4c467e99-93f8-bb64-6b65-9ab0e7b36087', // ⚠️ 만료되면 재발급 필요
   excelFileName: '재고관리.xlsx',
   sheetName: '재고관리'
 };
@@ -52,6 +52,11 @@ function loadTokens() {
 }
 
 function saveTokens(tokens) {
+  // Render 환경에서는 파일 저장 안 함 (서버 재시작하면 사라지기 때문)
+  if (process.env.RENDER) {
+    console.log('ℹ️ Render 환경: Token 파일 저장 생략');
+    return;
+  }
   try {
     fs.writeFileSync(TOKEN_FILE, JSON.stringify(tokens, null, 2));
     console.log('✅ Token 저장 완료');
@@ -142,25 +147,38 @@ async function refreshAccessToken(refreshToken) {
 async function getValidAccessToken() {
   let tokens = loadTokens();
 
-  if (!tokens) {
-    tokens = await getInitialTokens();
-    if (!tokens) {
-      throw new Error('Token 발급 실패. Authorization Code를 다시 발급받아야 합니다.');
+  // ✅ Render 환경변수에 REFRESH_TOKEN이 있으면 항상 우선 사용
+  if (process.env.REFRESH_TOKEN) {
+    if (!tokens || Date.now() >= (tokens.expires_at || 0) - 60000) {
+      console.log('🔑 환경변수 Refresh Token으로 갱신 중...');
+      const newTokens = await refreshAccessToken(process.env.REFRESH_TOKEN);
+      if (newTokens) {
+        return newTokens.access_token;
+      }
+    } else if (tokens) {
+      return tokens.access_token;
     }
   }
 
+  // 로컬 환경: 파일에서 토큰 로드
+  if (!tokens) {
+    console.log('⚠️ 저장된 Token이 없습니다. Device Flow를 시작합니다...');
+    tokens = await getTokenViaDeviceFlow();
+    if (!tokens) {
+      throw new Error('Token 발급 실패. Render라면 REFRESH_TOKEN 환경변수를 설정하세요.');
+    }
+  }
+
+  // Token 만료 시 갱신
   if (Date.now() >= tokens.expires_at - 60000) {
     tokens = await refreshAccessToken(tokens.refresh_token);
     if (!tokens) {
-      // Refresh Token도 만료 → Authorization Code 재발급 필요
-      console.log('\n⚠️ Refresh Token 만료! Authorization Code를 재발급 받아야 합니다.\n');
-      throw new Error('Refresh Token 만료. Authorization Code를 다시 발급받아야 합니다.');
+      throw new Error('Token 갱신 실패.');
     }
   }
 
   return tokens.access_token;
 }
-
 // ============================================================
 // 재고 변경 이력 로그 관리
 // ============================================================
@@ -777,3 +795,86 @@ app.listen(PORT, () => {
   console.log(`\n📁 OneDrive 엑셀 파일: ${CONFIG.excelFileName}`);
   console.log(`📊 시트명: ${CONFIG.sheetName}\n`);
 });
+
+// ============================================================
+// Device Code Flow로 Token 발급
+// ============================================================
+async function getTokenViaDeviceFlow() {
+  try {
+    console.log('\n📱 Device Code Flow 시작...\n');
+
+    const deviceCodeResponse = await axios.post(
+      'https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode',
+      new URLSearchParams({
+        client_id: CONFIG.clientId,
+        scope: 'Files.ReadWrite Files.ReadWrite.All offline_access'
+      }),
+      {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+      }
+    );
+
+    const { user_code, device_code, verification_uri, expires_in, interval } = deviceCodeResponse.data;
+
+    console.log('════════════════════════════════════════════════════');
+    console.log('🔐 아래 단계를 따라하세요:');
+    console.log('════════════════════════════════════════════════════');
+    console.log(`\n1. 휴대폰이나 다른 기기에서 이 URL 접속:`);
+    console.log(`   👉 ${verification_uri}`);
+    console.log(`\n2. 화면에 이 코드를 입력하세요:`);
+    console.log(`   👉 ${user_code}`);
+    console.log(`\n3. 개인 Microsoft 계정으로 로그인하세요`);
+    console.log(`   (${CONFIG.clientId.substring(0, 8)}...로 시작하는 앱)`);
+    console.log(`\n⏰ ${expires_in}초 안에 완료해야 합니다.\n`);
+    console.log('대기 중');
+
+    const pollingInterval = (interval || 5) * 1000;
+    const maxAttempts = Math.floor(expires_in / (interval || 5));
+
+    for (let i = 0; i < maxAttempts; i++) {
+      await new Promise(resolve => setTimeout(resolve, pollingInterval));
+
+      try {
+        const tokenResponse = await axios.post(
+          'https://login.microsoftonline.com/consumers/oauth2/v2.0/token',
+          new URLSearchParams({
+            client_id: CONFIG.clientId,
+            grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+            device_code: device_code
+          }),
+          {
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+          }
+        );
+
+        const tokens = {
+          access_token: tokenResponse.data.access_token,
+          refresh_token: tokenResponse.data.refresh_token,
+          expires_at: Date.now() + (tokenResponse.data.expires_in * 1000)
+        };
+
+        saveTokens(tokens);
+        console.log('\n✅ 인증 성공! Token 발급 완료!\n');
+        console.log('📄 Refresh Token이 onedrive_tokens.json에 저장되었습니다.\n');
+        return tokens;
+
+      } catch (error) {
+        if (error.response?.data?.error === 'authorization_pending') {
+          process.stdout.write('.');
+        } else if (error.response?.data?.error === 'authorization_declined') {
+          console.log('\n❌ 사용자가 권한을 거부했습니다.');
+          return null;
+        } else {
+          throw error;
+        }
+      }
+    }
+
+    console.log('\n❌ 시간 초과: 인증을 완료하지 못했습니다.');
+    return null;
+
+  } catch (error) {
+    console.error('\n❌ Device Code Flow 실패:', error.response?.data || error.message);
+    return null;
+  }
+}
