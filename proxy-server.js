@@ -78,7 +78,6 @@ async function refreshAccessToken(refreshToken) {
       'https://login.microsoftonline.com/common/oauth2/v2.0/token',
       new URLSearchParams({
         client_id: CONFIG.clientId,
-        client_secret: CONFIG.clientSecret,
         refresh_token: refreshToken,
         grant_type: 'refresh_token'
       }),
