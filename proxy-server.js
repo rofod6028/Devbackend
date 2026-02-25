@@ -260,7 +260,8 @@ async function updateExcelOnOneDrive(data, retries = 3) {
         '적용설비': item.적용설비,
         '현재수량': item.현재수량,
         '최소보유수량': item.최소보유수량,
-        '최종수정시각': item.최종수정시각
+        '최종수정시각': item.최종수정시각,
+        '작업자': item.작업자
       })));
 
       const workbook = XLSX.utils.book_new();
@@ -404,6 +405,7 @@ app.post('/api/inventory/manual-update', async (req, res) => {
     const oldQuantity = item.현재수량;
     item.현재수량 = 현재수량;
     item.최종수정시각 = new Date().toLocaleString('ko-KR');
+    item.작업자 = user;
 
     const success = await updateExcelOnOneDrive(data);
     if (success) {
