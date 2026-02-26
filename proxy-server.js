@@ -361,12 +361,13 @@ app.get('/api/inventory/summary', async (req, res) => {
   try {
     const data = await fetchExcelFromOneDrive();
     const summary = {
-      totalItems: data.length,
-      totalQuantity: data.reduce((sum, d) => sum + d.현재수량, 0),
-      lowStockItems: data.filter(d => d.현재수량 <= d.최소보유수량),
-      lowStockCount: data.filter(d => d.현재수량 <= d.최소보유수량).length,
-      categoryBreakdown: {}
-    };
+  totalItems: data.length,
+  totalQuantity: data.reduce((sum, d) => sum + d.현재수량, 0),
+  // ✨ 최소보유수량이 0보다 큰 항목들 중에서만 재고 부족을 찾습니다.
+  lowStockItems: data.filter(d => d.최소보유수량 > 0 && d.현재수량 <= d.최소보유수량),
+  lowStockCount: data.filter(d => d.최소보유수량 > 0 && d.현재수량 <= d.최소보유수량).length,
+  categoryBreakdown: {}
+};
     data.forEach(item => {
       if (!summary.categoryBreakdown[item.부품종류]) {
         summary.categoryBreakdown[item.부품종류] = { total: 0, count: 0, lowStock: 0 };
