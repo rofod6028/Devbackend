@@ -329,13 +329,14 @@ app.get('/api/inventory/categories', async (req, res) => {
     const data = await fetchExcelFromOneDrive();
     const categories = {};
     data.forEach(item => {
-      if (!categories[item.부품종류]) {
-        categories[item.부품종류] = { name: item.부품종류, totalCount: 0, itemCount: 0, lowStockCount: 0, items: [] };
+      const mainCat = item.대분류 || '미분류'; // ✨ 대분류를 기준으로 사용
+      if (!categories[mainCat]) {
+        categories[mainCat] = { name: mainCat, totalCount: 0, itemCount: 0, lowStockCount: 0, items: [] };
       }
-      categories[item.부품종류].items.push(item);
-      categories[item.부품종류].totalCount += item.현재수량;
-      categories[item.부품종류].itemCount += 1;
-      if (item.현재수량 <= item.최소보유수량) categories[item.부품종류].lowStockCount += 1;
+      categories[mainCat].items.push(item);
+      categories[mainCat].totalCount += item.현재수량;
+      categories[mainCat].itemCount += 1;
+      if (item.현재수량 <= item.최소보유수량) categories[mainCat].lowStockCount += 1;
     });
     res.json({ success: true, data: Object.values(categories) });
   } catch (error) {
@@ -346,7 +347,8 @@ app.get('/api/inventory/categories', async (req, res) => {
 app.get('/api/inventory/category/:categoryName', async (req, res) => {
   try {
     const data = await fetchExcelFromOneDrive();
-    const filtered = data.filter(item => item.부품종류 === req.params.categoryName);
+    // ✨ 부품종류가 아니라 대분류(categoryName)로 필터링합니다.
+    const filtered = data.filter(item => item.대분류 === req.params.categoryName);
     res.json({ success: true, data: filtered });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
