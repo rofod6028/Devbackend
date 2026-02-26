@@ -236,6 +236,7 @@ async function fetchExcelFromOneDrive() {
       현재수량: Number(row['현재수량']) || 0,
       최소보유수량: Number(row['최소보유수량']) || 0,
       최종수정시각: row['최종수정시각'] || ''
+      작업자: row['작업자'] || ''
     }));
 
     cachedData = mappedData;
@@ -397,7 +398,7 @@ app.post('/api/inventory/update', async (req, res) => {
 
 app.post('/api/inventory/manual-update', async (req, res) => {
   try {
-    const { id, 현재수량, action } = req.body;
+    const { id, 현재수량, action, user } = req.body;
     const data = await fetchExcelFromOneDrive();
     const item = data.find(d => d.id === id);
     if (!item) return res.status(404).json({ success: false, message: '항목을 찾을 수 없습니다.' });
