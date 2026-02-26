@@ -230,6 +230,7 @@ async function fetchExcelFromOneDrive() {
     const jsonData = XLSX.utils.sheet_to_json(worksheet);
     const mappedData = jsonData.map((row, index) => ({
       id: index + 1,
+      대분류: row['대분류'] || '미분류',
       부품종류: row['부품종류'] || '',
       모델명: row['모델명'] || '',
       적용설비: row['적용설비'] || '',
@@ -257,6 +258,7 @@ async function updateExcelOnOneDrive(data, retries = 3) {
       const accessToken = await getValidAccessToken();
 
       const worksheet = XLSX.utils.json_to_sheet(data.map(item => ({
+        '대분류': item.대분류,
         '부품종류': item.부품종류,
         '모델명': item.모델명,
         '적용설비': item.적용설비,
