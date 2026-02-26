@@ -462,7 +462,7 @@ app.get('/api/inventory/alerts', async (req, res) => {
   try {
     const data = await fetchExcelFromOneDrive();
     const alerts = data
-  .filter(item => item.최소보유수량 > 0 && item.현재수량 <= item.최소보유수량) // ✨ 최소수량이 0보다 클 때만 필터링
+      .filter(item => item.최소보유수량 > 0 && item.현재수량 <= item.최소보유수량) // ✨ 조건 추가
       .map(item => ({
         id: item.id,
         부품종류: item.부품종류,
