@@ -534,14 +534,18 @@ ${inventoryTable}
         const { action, items } = updateData;
 
         for (const item of items) {
-          const targetItem = inventoryData.find(d => d.모델명 === item.모델명);
-          if (targetItem) {
-            if (action === '출고') targetItem.현재수량 = Math.max(0, targetItem.현재수량 - item.수량);
-            else if (action === '입고') targetItem.현재수량 += item.수량;
-            targetItem.최종수정시각 = new Date().toLocaleString('ko-KR');
-            addLog(action, targetItem, action === '입고' ? item.수량 : -item.수량, 'AI');
-          }
-        }
+  const targetItem = inventoryData.find(d => d.모델명 === item.모델명);
+  if (targetItem) {
+    if (action === '출고') targetItem.현재수량 = Math.max(0, targetItem.현재수량 - item.수량);
+    else if (action === '입고') targetItem.현재수량 += item.수량;
+    
+    targetItem.최종수정시각 = new Date().toLocaleString('ko-KR');
+    // ✨ 작업자 이름을 'AI 어시스턴트' 혹은 전달받은 사용자 이름으로 기록
+    targetItem.작업자 = req.body.user || 'AI 어시스턴트'; 
+
+    addLog(action, targetItem, action === '입고' ? item.수량 : -item.수량, targetItem.작업자);
+  }
+}
 
         const success = await updateExcelOnOneDrive(inventoryData);
         if (success) {
