@@ -483,14 +483,16 @@ app.post('/api/ai/chat', async (req, res) => {
     let inventoryData = await fetchExcelFromOneDrive();
 
     const inventoryTable = inventoryData.map(item =>
-      `- ${item.부품종류} | ${item.모델명} | 적용설비: ${item.적용설비} | **현재수량: ${item.현재수량}개** | 최소수량: ${item.최소보유수량}개 | 상태: ${item.현재수량 <= item.최소보유수량 ? '⚠️부족' : '✅정상'}`
+      `- ${item.부품종류} | ${item.모델명} | 적용설비: ${item.적용설비} | **현재수량: ${item.현재수량}개** | 용도: ${item.용도 || '정보 없음'} | 상태: ${item.현재수량 <= item.최소보유수량 ? '⚠️부족' : '✅정상'}`
     ).join('\n');
 
     const systemPrompt = `당신은 스페어파츠 재고 관리 AI 어시스턴트입니다.
 
-현재 재고 현황:
+현재 재고 현황(용도 포함):
 ${inventoryTable}
 
+사용자가 부품의 용도를 물어보면 위 데이터의 '용도' 항목을 참고하여 답변하세요. 
+만약 특정 용도에 맞는 부품을 찾으면 해당 모델명을 추천해 주세요.
 입출고 명령 시 응답 맨 끝에 아래 형식 추가:
 ~~~INVENTORY_UPDATE
 {"action": "출고" 또는 "입고", "items": [{"모델명": "XXX", "수량": N}]}
