@@ -236,7 +236,8 @@ async function fetchExcelFromOneDrive() {
       현재수량: Number(row['현재수량']) || 0,
       최소보유수량: Number(row['최소보유수량']) || 0,
       최종수정시각: row['최종수정시각'] || '',
-      작업자: row['작업자'] || ''
+      작업자: row['작업자'] || '',
+      용도: row['용도'] || ''
     }));
 
     cachedData = mappedData;
@@ -262,7 +263,8 @@ async function updateExcelOnOneDrive(data, retries = 3) {
         '현재수량': item.현재수량,
         '최소보유수량': item.최소보유수량,
         '최종수정시각': item.최종수정시각,
-        '작업자': item.작업자
+        '작업자': item.작업자,
+        '용도': item.용도
       })));
 
       const workbook = XLSX.utils.book_new();
