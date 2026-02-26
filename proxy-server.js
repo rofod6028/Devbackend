@@ -445,10 +445,11 @@ app.get('/api/inventory/search', async (req, res) => {
     const data = await fetchExcelFromOneDrive();
     const searchTerm = q.toLowerCase();
     const results = data.filter(item =>
-      item.모델명.toLowerCase().includes(searchTerm) ||
-      item.부품종류.toLowerCase().includes(searchTerm) ||
-      item.적용설비.toLowerCase().includes(searchTerm)
-    );
+  (item.대분류 && item.대분류.toLowerCase().includes(searchTerm)) || // ✨ 대분류 검색 추가
+  item.모델명.toLowerCase().includes(searchTerm) ||
+  item.부품종류.toLowerCase().includes(searchTerm) ||
+  item.적용설비.toLowerCase().includes(searchTerm)
+);
     res.json({ success: true, data: results });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
