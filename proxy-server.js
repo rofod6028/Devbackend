@@ -336,7 +336,9 @@ app.get('/api/inventory/categories', async (req, res) => {
       categories[mainCat].items.push(item);
       categories[mainCat].totalCount += item.현재수량;
       categories[mainCat].itemCount += 1;
-      if (item.현재수량 <= item.최소보유수량) categories[mainCat].lowStockCount += 1;
+      if (item.최소보유수량 > 0 && item.현재수량 <= item.최소보유수량) {
+  categories[mainCat].lowStockCount += 1;
+}
     });
     res.json({ success: true, data: Object.values(categories) });
   } catch (error) {
@@ -460,7 +462,7 @@ app.get('/api/inventory/alerts', async (req, res) => {
   try {
     const data = await fetchExcelFromOneDrive();
     const alerts = data
-      .filter(item => item.현재수량 <= item.최소보유수량)
+  .filter(item => item.최소보유수량 > 0 && item.현재수량 <= item.최소보유수량) // ✨ 최소수량이 0보다 클 때만 필터링
       .map(item => ({
         id: item.id,
         부품종류: item.부품종류,
