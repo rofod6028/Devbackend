@@ -448,16 +448,20 @@ app.get('/api/inventory/search', async (req, res) => {
     const data = await fetchExcelFromOneDrive();
     const searchTerm = q.toLowerCase();
     const results = data.filter(item => {
-  const model = (item.모델명 || '').toLowerCase();
-  const part = (item.부품종류 || '').toLowerCase();
-  const machine = (item.적용설비 || '').toLowerCase();
-  const mainCat = (item.대분류 || '').toLowerCase();
-
-  return model.includes(searchTerm) || 
-         part.includes(searchTerm) || 
-         machine.includes(searchTerm) ||
-         mainCat.includes(searchTerm);
-});
+      // 검색어와 비교할 각 항목들에서 공백을 제거하고 소문자로 통일합니다.
+      const model = (item.모델명 || '').toLowerCase().replace(/\s+/g, '');
+      const part = (item.부품종류 || '').toLowerCase().replace(/\s+/g, '');
+      const machine = (item.적용설비 || '').toLowerCase().replace(/\s+/g, '');
+      const mainCat = (item.대분류 || '').toLowerCase().replace(/\s+/g, '');
+      const usage = (item.용도 || '').toLowerCase().replace(/\s+/g, ''); // ✨ 용도 추가
+      
+      // 검색어가 위 항목 중 하나라도 포함되어 있으면 결과에 넣습니다.
+      return model.includes(searchTerm) || 
+             part.includes(searchTerm) || 
+             machine.includes(searchTerm) ||
+             mainCat.includes(searchTerm) ||
+             usage.includes(searchTerm); // ✨ 용도 검색 조건 추가
+    });
     res.json({ success: true, data: results });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
