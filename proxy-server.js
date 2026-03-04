@@ -228,18 +228,21 @@ async function fetchExcelFromOneDrive() {
     }
 
     const jsonData = XLSX.utils.sheet_to_json(worksheet);
-    const mappedData = jsonData.map((row, index) => ({
-      id: index + 1,
-      대분류: row['대분류'] || '미분류',
-      부품종류: row['부품종류'] || '',
-      모델명: row['모델명'] || '',
-      적용설비: row['적용설비'] || '',
-      현재수량: Number(row['현재수량']) || 0,
-      최소보유수량: Number(row['최소보유수량']) || 0,
-      최종수정시각: row['최종수정시각'] || '',
-      작업자: row['작업자'] || '',
-      용도: row['용도'] || ''
-    }));
+    const mappedData = jsonData.map((row, index) => {
+      // 엑셀의 열 이름을 문자열 그대로 사용하여 데이터를 가져옵니다.
+      return {
+        id: index + 1,
+        대분류: row['대분류'] || '미분류',
+        부품종류: row['부품종류'] || '',
+        모델명: row['모델명'] || '',
+        적용설비: row['적용설비'] || '',
+        현재수량: Number(row['현재수량']) || 0,
+        최소보유수량: Number(row['최소보유수량']) || 0,
+        최종수정시각: row['최종수정시각'] || '',
+        작업자: row['작업자'] || '',
+        용도: row['용도'] || ''
+      };
+    });
 
     cachedData = mappedData;
     lastFetchTime = now;
@@ -448,19 +451,18 @@ app.get('/api/inventory/search', async (req, res) => {
     const data = await fetchExcelFromOneDrive();
     const searchTerm = q.toLowerCase();
     const results = data.filter(item => {
-      // 검색어와 비교할 각 항목들에서 공백을 제거하고 소문자로 통일합니다.
-      const model = (item.모델명 || '').toLowerCase().replace(/\s+/g, '');
-      const part = (item.부품종류 || '').toLowerCase().replace(/\s+/g, '');
-      const machine = (item.적용설비 || '').toLowerCase().replace(/\s+/g, '');
-      const mainCat = (item.대분류 || '').toLowerCase().replace(/\s+/g, '');
-      const usage = (item.용도 || '').toLowerCase().replace(/\s+/g, ''); // ✨ 용도 추가
+      const searchTerm = q.toLowerCase().replace(/\s+/g, '');
       
-      // 검색어가 위 항목 중 하나라도 포함되어 있으면 결과에 넣습니다.
-      return model.includes(searchTerm) || 
-             part.includes(searchTerm) || 
-             machine.includes(searchTerm) ||
-             mainCat.includes(searchTerm) ||
-             usage.includes(searchTerm); // ✨ 용도 검색 조건 추가
+      // 검색 대상이 될 텍스트들을 하나의 덩어리로 합쳐서 검색 효율을 높입니다.
+      const targetText = [
+        item.대분류,
+        item.부품종류,
+        item.모델명,
+        item.적용설비,
+        item.용도
+      ].join('').toLowerCase().replace(/\s+/g, '');
+
+      return targetText.includes(searchTerm);
     });
     res.json({ success: true, data: results });
   } catch (error) {
