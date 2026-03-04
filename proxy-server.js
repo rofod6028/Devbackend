@@ -101,7 +101,6 @@ async function refreshAccessToken(refreshToken) {
     return null;
   }
 }
-
 async function getValidAccessToken() {
   // ✅ 환경변수에 REFRESH_TOKEN 있으면 최우선 사용
   if (process.env.REFRESH_TOKEN) {
@@ -172,7 +171,7 @@ function addLog(action, item, quantityChange, user = 'System') {
   const newLog = {
     id: uuidv4(),
     timestamp: new Date().toISOString(),
-    timestampKR: new Date().toLocaleString('ko-KR'),
+    timestampKR: getKSTDate(), // 한국 시간 함수 사용
     action,
     부품종류: item.부품종류,
     모델명: item.모델명,
@@ -314,7 +313,16 @@ function getDummyData() {
     { id: 5, 부품종류: '패킹', 모델명: 'Teikoku-S1', 적용설비: '펌프A', 현재수량: 30, 최소보유수량: 10, 최종수정시각: '2026-02-03 07:45' },
   ];
 }
-
+const getKSTDate = () => {
+  const curr = new Date();
+  // 한국 시간(UTC+9) 계산
+  const utc = curr.getTime() + (curr.getTimezoneOffset() * 60 * 1000);
+  const KR_TIME_DIFF = 9 * 60 * 60 * 1000;
+  const kstDate = new Date(utc + KR_TIME_DIFF);
+  
+  // '2024. 3. 4. 오후 12:30:45' 형식으로 반환
+  return kstDate.toLocaleString('ko-KR');
+};
 // ============================================================
 // API Routes
 // ============================================================
@@ -394,7 +402,7 @@ app.post('/api/inventory/update', async (req, res) => {
 
     const oldQuantity = item.현재수량;
     item.현재수량 = 현재수량;
-    item.최종수정시각 = new Date().toLocaleString('ko-KR');
+    item.최종수정시각 = getKSTDate(); // 한국 시간 함수 사용
 
     const success = await updateExcelOnOneDrive(data);
     if (success) {
@@ -550,7 +558,7 @@ ${inventoryTable}
     if (action === '출고') targetItem.현재수량 = Math.max(0, targetItem.현재수량 - item.수량);
     else if (action === '입고') targetItem.현재수량 += item.수량;
     
-    targetItem.최종수정시각 = new Date().toLocaleString('ko-KR');
+    targetItem.최종수정시각 = getKSTDate(); // 한국 시간 함수 사용
 // 사용자가 입력한 이름을 먼저 쓰고, 없으면 'AI(이름미상)'으로 기록
 const actualUser = req.body.user || 'AI(이름미상)';
 targetItem.작업자 = actualUser; 
