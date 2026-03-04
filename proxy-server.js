@@ -447,12 +447,17 @@ app.get('/api/inventory/search', async (req, res) => {
     if (!q || q.trim().length < 2) return res.json({ success: true, data: [] });
     const data = await fetchExcelFromOneDrive();
     const searchTerm = q.toLowerCase();
-    const results = data.filter(item =>
-  (item.대분류 && item.대분류.toLowerCase().includes(searchTerm)) || // ✨ 대분류 검색 추가
-  item.모델명.toLowerCase().includes(searchTerm) ||
-  item.부품종류.toLowerCase().includes(searchTerm) ||
-  item.적용설비.toLowerCase().includes(searchTerm)
-);
+    const results = data.filter(item => {
+  const model = (item.모델명 || '').toLowerCase();
+  const part = (item.부품종류 || '').toLowerCase();
+  const machine = (item.적용설비 || '').toLowerCase();
+  const mainCat = (item.대분류 || '').toLowerCase();
+
+  return model.includes(searchTerm) || 
+         part.includes(searchTerm) || 
+         machine.includes(searchTerm) ||
+         mainCat.includes(searchTerm);
+});
     res.json({ success: true, data: results });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
@@ -540,10 +545,11 @@ ${inventoryTable}
     else if (action === '입고') targetItem.현재수량 += item.수량;
     
     targetItem.최종수정시각 = new Date().toLocaleString('ko-KR');
-    // ✨ 작업자 이름을 'AI 어시스턴트' 혹은 전달받은 사용자 이름으로 기록
-    targetItem.작업자 = req.body.user || 'AI 어시스턴트'; 
+// 사용자가 입력한 이름을 먼저 쓰고, 없으면 'AI(이름미상)'으로 기록
+const actualUser = req.body.user || 'AI(이름미상)';
+targetItem.작업자 = actualUser; 
 
-    addLog(action, targetItem, action === '입고' ? item.수량 : -item.수량, targetItem.작업자);
+addLog(action, targetItem, action === '입고' ? item.수량 : -item.수량, actualUser);
   }
 }
 
