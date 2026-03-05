@@ -234,8 +234,11 @@ async function fetchExcelFromOneDrive() {
     }
 
     const jsonData = XLSX.utils.sheet_to_json(worksheet);
-    const mappedData = jsonData.map((row, index) => {
-      // 엑셀의 열 이름을 문자열 그대로 사용하여 데이터를 가져옵니다.
+        const mappedData = jsonData.map((row, index) => {
+      // 엑셀 열 이름 중 '보관장소'를 찾습니다.
+      const rowKeys = Object.keys(row);
+      const foundKey = rowKeys.find(key => key.trim() === '보관장소');
+
       return {
         id: index + 1,
         대분류: row['대분류'] || '미분류',
@@ -247,7 +250,8 @@ async function fetchExcelFromOneDrive() {
         최종수정시각: row['최종수정시각'] || '',
         작업자: row['작업자'] || '',
         용도: row['용도'] || '',
-        보관장소: row[storageKey] || '위치 미지정' 
+        // ✨ storageKey 대신 찾은 키(foundKey)를 사용하여 안전하게 읽어옵니다.
+        보관장소: foundKey ? row[foundKey] : '위치 미지정'
       };
     });
 
