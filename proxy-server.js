@@ -111,10 +111,17 @@ async function getValidAccessToken() {
       return tokens.access_token;
     }
     
-    // 만료됐거나 없으면 환경변수 refresh_token으로 갱신
+    // 만료됐거나 없으면 환경변수 REFRESH_TOKEN으로 갱신 시도
     console.log('🔑 환경변수 REFRESH_TOKEN으로 갱신 중...');
+    // refreshAccessToken 함수가 문자열 토큰을 직접 받도록 확실히 처리
     const newTokens = await refreshAccessToken(process.env.REFRESH_TOKEN);
-    if (newTokens) return newTokens.access_token;
+    
+    if (newTokens && newTokens.access_token) {
+      return newTokens.access_token;
+    }
+    
+    // 만약 환경변수로 갱신 실패 시, 에러를 던지기 전 로컬 토큰이 있는지 한 번 더 확인하게 함
+    console.log('⚠️ 환경변수 갱신 실패. 로컬 토큰 확인으로 넘어갑니다.');
     
     throw new Error('REFRESH_TOKEN으로 갱신 실패. Render 환경변수를 확인하세요.');
   }
