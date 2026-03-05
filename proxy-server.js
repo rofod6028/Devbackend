@@ -246,7 +246,8 @@ async function fetchExcelFromOneDrive() {
         최소보유수량: Number(row['최소보유수량']) || 0,
         최종수정시각: row['최종수정시각'] || '',
         작업자: row['작업자'] || '',
-        용도: row['용도'] || ''
+        용도: row['용도'] || '',
+        보관장소: row[storageKey] || '위치 미지정' 
       };
     });
 
