@@ -280,7 +280,8 @@ async function updateExcelOnOneDrive(data, retries = 3) {
         '최소보유수량': item.최소보유수량,
         '최종수정시각': item.최종수정시각,
         '작업자': item.작업자,
-        '용도': item.용도
+        '용도': item.용도,
+        '보관장소': item.보관장소
       })));
 
       const workbook = XLSX.utils.book_new();
