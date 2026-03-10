@@ -246,7 +246,9 @@ async function fetchExcelFromOneDrive() {
         최소보유수량: Number(row['최소보유수량']) || 0,
         최종수정시각: row['최종수정시각'] || '',
         작업자: row['작업자'] || '',
-        용도: row['용도'] || ''
+              용도: row['용도'] || '',
+        // ✨ 정의되지 않은 변수 에러를 막기 위해 foundStorageKey 사용
+        보관장소: foundStorageKey ? row[foundStorageKey] : '위치 미지정'
       };
     });
 
@@ -517,7 +519,7 @@ app.post('/api/ai/chat', async (req, res) => {
     let inventoryData = await fetchExcelFromOneDrive();
 
     const inventoryTable = inventoryData.map(item =>
-      `- ${item.부품종류} | ${item.모델명} | 적용설비: ${item.적용설비} | **현재수량: ${item.현재수량}개** | 용도: ${item.용도 || '정보 없음'} | 상태: ${item.현재수량 <= item.최소보유수량 ? '⚠️부족' : '✅정상'}`
+      `- ${item.부품종류} | ${item.모델명} | 위치: ${item.보관장소 || '미지정'} | 현재: ${item.현재수량}개 | 용도: ${item.용도 || '없음'}`
     ).join('\n');
 
     const systemPrompt = `당신은 스페어파츠 재고 관리 AI 어시스턴트입니다.
