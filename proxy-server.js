@@ -260,17 +260,17 @@ async function updateExcelOnOneDrive(data, retries = 3) {
       const accessToken = await getValidAccessToken();
 
       const worksheet = XLSX.utils.json_to_sheet(data.map(item => ({
-        '대분류': item.대분류,
-        '부품종류': item.부품종류,
-        '모델명': item.모델명,
-        '적용설비': item.적용설비,
-        '현재수량': item.현재수량,
-        '최소보유수량': item.최소보유수량,
-        '최종수정시각': item.최종수정시각,
-        '작업자': item.작업자,
-        '용도': item.용도,
-        '보관장소': item.보관장소
-      })));
+      '대분류': item.대분류 || '미분류',
+      '부품종류': item.부품종류 || '',
+      '모델명': item.모델명 || '',
+      '적용설비': item.적용설비 || '',
+      '현재수량': Number(item.현재수량) || 0,
+      '최소보유수량': Number(item.최소보유수량) || 0,
+      '최종수정시각': item.최종수정시각 || '',
+      '작업자': item.작업자 || '',
+      '용도': item.용도 || '',
+      '보관장소': item.보관장소 || '위치 미지정' // ✨ 엑셀 헤더와 정확히 일치해야 함
+    })));
 
       const workbook = XLSX.utils.book_new();
       XLSX.utils.book_append_sheet(workbook, worksheet, CONFIG.sheetName);
@@ -407,10 +407,24 @@ app.post('/api/inventory/update', async (req, res) => {
 
     const success = await updateExcelOnOneDrive(data);
     if (success) {
-      addLog('수정', item, 현재수량 - oldQuantity, 'API');
-      res.json({ success: true, message: '업데이트 완료', data: item });
+      // 로그를 남길 때 item 객체가 살아있는지 확인하며 안전하게 기록
+      try {
+        addLog(action || '수정', item, 현재수량 - oldQuantity, user || 'Manual');
+      } catch (logErr) {
+        console.error('로그 기록 중 오류(무시됨):', logErr.message);
+      }
+      
+      // 프론트엔드에 성공 응답을 명확히 보냄
+      return res.status(200).json({ 
+        success: true, 
+        message: '업데이트 완료', 
+        data: item 
+      });
     } else {
-      res.status(500).json({ success: false, message: 'OneDrive 업데이트 실패' });
+      return res.status(500).json({ 
+        success: false, 
+        message: 'OneDrive 업데이트 실패' 
+      });
     }
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
