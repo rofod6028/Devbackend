@@ -508,15 +508,20 @@ app.get('/api/inventory/alerts', async (req, res) => {
 app.post('/api/ai/chat', async (req, res) => {
   try {
     const { message, conversationHistory } = req.body;
+
+    // 1. ✨ 캐시를 강제로 비우고 OneDrive에서 새로 가져오도록 명령
+    invalidateCache(); 
     let inventoryData = await fetchExcelFromOneDrive();
 
+    // 2. ✨ AI에게 "지금 이 데이터가 실시간 엑셀의 진짜 값이다"라고 강조
     const inventoryTable = inventoryData.map(item =>
-      `- ${item.부품종류} | ${item.모델명} | 적용설비: ${item.적용설비} | **현재수량: ${item.현재수량}개** | 용도: ${item.용도 || '정보 없음'} | 상태: ${item.현재수량 <= item.최소보유수량 ? '⚠️부족' : '✅정상'}`
+      `- [${item.대분류}] ${item.모델명} | 현재수량: ${item.현재수량}개 | 위치: ${item.보관장소} | 용도: ${item.용도 || '없음'}`
     ).join('\n');
 
-    const systemPrompt = `당신은 스페어파츠 재고 관리 AI 어시스턴트입니다.
+    const systemPrompt = `당신은 실시간 엑셀 데이터와 동기화된 재고 관리 어시스턴트입니다.
+반드시 아래의 **최신 재고 현황**만을 근거로 답변하세요. 이전 대화에서 당신이 계산한 수치보다 아래 데이터가 우선입니다.
 
-현재 재고 현황(용도 포함):
+[최신 재고 현황]
 ${inventoryTable}
 
 사용자가 부품의 용도를 물어보면 위 데이터의 '용도' 항목을 참고하여 답변하세요. 
