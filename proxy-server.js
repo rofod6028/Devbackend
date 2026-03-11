@@ -293,9 +293,15 @@ async function updateExcelOnOneDrive(data, retries = 3) {
 
     } catch (error) {
       const errorCode = error.response?.data?.error?.code;
-      console.error(`❌ OneDrive 쓰기 실패 (${attempt}/${retries}):`, error.message);
+      const errorDetail = error.response?.data?.error?.message;
+      
+      // 상세 로그 출력 (이게 핵심입니다!)
+      console.error(`❌ OneDrive 쓰기 실패 (${attempt}/${retries})`);
+      console.error(`❌ 에러 코드: ${errorCode}`);
+      console.error(`❌ 상세 메시지: ${errorDetail || error.message}`);
 
       if ((errorCode === 'notAllowed' || errorCode === 'resourceLocked') && attempt < retries) {
+        console.log("🔄 파일이 잠겨있거나 권한 문제로 재시도합니다...");
         await new Promise(resolve => setTimeout(resolve, attempt * 2000));
         continue;
       }
@@ -549,56 +555,54 @@ ${inventoryTable}
     let updateResult = null;
 
     // 4. AI 답변에서 명령어 추출 및 실행
-    if (responseText.includes('~~~INVENTORY_UPDATE')) {
-      try {
-        const parts = responseText.split('~~~INVENTORY_UPDATE');
-        // ✨ 수정된 부분: 배열인 parts[1]에 접근하여 split을 수행해야 합니다.
-        let jsonPart = parts[1].split('~~~')[0].trim(); 
-        
-        // 혹시라도 AI가 섞어 쓴 마크다운 제거
-        jsonPart = jsonPart.replace(/```json|```/g, ''); 
-        
-        const updateData = JSON.parse(jsonPart);
-        const { action, items } = updateData;
+if (responseText.includes('~~~INVENTORY_UPDATE')) {
+  console.log("🤖 AI가 재고 수정 명령을 보냈습니다. 분석을 시작합니다...");
+  try {
+    const parts = responseText.split('~~~INVENTORY_UPDATE');
+    if (!parts[1]) throw new Error("AI 응답 형식이 올바르지 않습니다. (구분자 부족)");
 
-        for (const item of items) {
-          // 모델명 매칭 강화 (공백 제거 및 소문자 통일)
-          const targetItem = inventoryData.find(d => 
-            (d.modelo명 || d.모델명 || '').replace(/\s+/g, '').toLowerCase() === (item.모델명 || '').replace(/\s+/g, '').toLowerCase()
-          );
+    let jsonPart = parts[1].split('~~~')[0].trim();
+    jsonPart = jsonPart.replace(/```json|```/g, ''); // 마크다운 제거
+    
+    console.log("📝 파싱할 JSON 데이터:", jsonPart);
+    const updateData = JSON.parse(jsonPart);
+    const { action, items } = updateData;
 
-          if (targetItem) {
-            // ✨ 수량 강제 숫자 변환 (데이터 안정성)
-            const changeQty = Number(item.수량) || 0;
-            
-            if (action === '출고') targetItem.현재수량 = Math.max(0, targetItem.현재수량 - changeQty);
-            else if (action === '입고') targetItem.현재수량 += changeQty;
-            
-            targetItem.최종수정시각 = getKSTDate(); 
-            const actualUser = user || 'AI 어시스턴트';
-            targetItem.작업자 = actualUser; 
+    for (const item of items) {
+      // 매핑 로직 강화 (문자열 강제 변환 및 공백 제거)
+      const targetItem = inventoryData.find(d => 
+        String(d.모델명 || '').replace(/\s+/g, '').toLowerCase() === 
+        String(item.모델명 || '').replace(/\s+/g, '').toLowerCase()
+      );
 
-            addLog(action, targetItem, action === '입고' ? changeQty : -changeQty, actualUser);
-          } else {
-            console.log(`⚠️ 모델명 매칭 실패: ${item.모델명}`);
-          }
-        }
-
-        // ✨ 정제된 전체 데이터 저장 (비동기 await 확인)
-        const success = await updateExcelOnOneDrive(inventoryData);
+      if (targetItem) {
+        const changeQty = Number(item.수량) || 0;
+        if (action === '출고') targetItem.현재수량 = Math.max(0, targetItem.현재수량 - changeQty);
+        else if (action === '입고') targetItem.현재수량 += changeQty;
         
-        if (success) {
-          inventoryUpdated = true;
-          updateResult = { success: true, action, items };
-          console.log(`✅ AI 재고 반영 성공: ${action}`);
-        }
-        
-        // 화면에는 기호 제외 텍스트만 노출
-        responseText = parts[0].trim();
-      } catch (error) {
-        console.error('❌ AI 명령어 파싱 실패:', error.message);
+        targetItem.최종수정시각 = getKSTDate();
+        targetItem.작업자 = user || 'AI 어시스턴트';
+        console.log(`✅ 매칭 성공: ${targetItem.모델명} -> 변경후 ${targetItem.현재수량}개`);
+      } else {
+        console.error(`⚠️ 매칭 실패: 엑셀에서 [${item.모델명}]을 찾을 수 없습니다.`);
       }
     }
+
+    // 전송 결과 로그 확인
+    const success = await updateExcelOnOneDrive(inventoryData);
+    console.log("💾 OneDrive 저장 시도 결과:", success ? "성공" : "실패");
+    
+    if (success) {
+      inventoryUpdated = true;
+      updateResult = { success: true, action, items };
+    }
+  } catch (error) {
+    console.error('❌ AI 반영 프로세스 중 오류 발생:', error.message);
+    console.error('❌ 에러 상세 내용:', error.stack);
+  }
+} else {
+  console.log("💡 AI 답변에 수정 명령이 포함되지 않았습니다.");
+}
 
     res.json({ success: true, message: responseText, inventoryUpdated, updateResult, timestamp: new Date().toISOString() });
   } catch (error) {
