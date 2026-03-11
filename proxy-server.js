@@ -550,38 +550,47 @@ ${inventoryTable}
     if (responseText.includes('~~~INVENTORY_UPDATE')) {
       try {
         const parts = responseText.split('~~~INVENTORY_UPDATE');
-        let jsonText = parts[1].split('~~~')[0].trim();
-        // 혹시라도 AI가 섞어 쓴 마크다운 제거
-        jsonText = jsonText.replace(/```json|```/g, ''); 
+        // ✨ 수정된 부분: 배열인 parts[1]에 접근하여 split을 수행해야 합니다.
+        let jsonPart = parts[1].split('~~~')[0].trim(); 
         
-        const updateData = JSON.parse(jsonText);
+        // 혹시라도 AI가 섞어 쓴 마크다운 제거
+        jsonPart = jsonPart.replace(/```json|```/g, ''); 
+        
+        const updateData = JSON.parse(jsonPart);
         const { action, items } = updateData;
 
         for (const item of items) {
-          // ✨ 모델명 매칭 강화 (공백 제거 및 소문자 통일)
+          // 모델명 매칭 강화 (공백 제거 및 소문자 통일)
           const targetItem = inventoryData.find(d => 
-            (d.모델명 || '').replace(/\s+/g, '').toLowerCase() === (item.모델명 || '').replace(/\s+/g, '').toLowerCase()
+            (d.modelo명 || d.모델명 || '').replace(/\s+/g, '').toLowerCase() === (item.모델명 || '').replace(/\s+/g, '').toLowerCase()
           );
 
           if (targetItem) {
-            if (action === '출고') targetItem.현재수량 = Math.max(0, targetItem.현재수량 - item.수량);
-            else if (action === '입고') targetItem.현재수량 += item.수량;
+            // ✨ 수량 강제 숫자 변환 (데이터 안정성)
+            const changeQty = Number(item.수량) || 0;
+            
+            if (action === '출고') targetItem.현재수량 = Math.max(0, targetItem.현재수량 - changeQty);
+            else if (action === '입고') targetItem.현재수량 += changeQty;
             
             targetItem.최종수정시각 = getKSTDate(); 
             const actualUser = user || 'AI 어시스턴트';
             targetItem.작업자 = actualUser; 
 
-            addLog(action, targetItem, action === '입고' ? item.수량 : -item.수량, actualUser);
+            addLog(action, targetItem, action === '입고' ? changeQty : -changeQty, actualUser);
           } else {
             console.log(`⚠️ 모델명 매칭 실패: ${item.모델명}`);
           }
         }
 
+        // ✨ 정제된 전체 데이터 저장 (비동기 await 확인)
         const success = await updateExcelOnOneDrive(inventoryData);
+        
         if (success) {
           inventoryUpdated = true;
           updateResult = { success: true, action, items };
+          console.log(`✅ AI 재고 반영 성공: ${action}`);
         }
+        
         // 화면에는 기호 제외 텍스트만 노출
         responseText = parts[0].trim();
       } catch (error) {
