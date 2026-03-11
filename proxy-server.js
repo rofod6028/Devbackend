@@ -102,64 +102,52 @@ async function refreshAccessToken(refreshToken) {
   }
 }
 async function getValidAccessToken() {
-  // ✅ 환경변수에 REFRESH_TOKEN 있으면 최우선 사용
+  // 1. 환경변수 REFRESH_TOKEN이 있다면 최우선으로 사용
   if (process.env.REFRESH_TOKEN) {
-    const tokens = loadTokens();
+    try {
+      console.log('🔑 환경변수 REFRESH_TOKEN으로 갱신 중...');
+      const response = await axios.post(
+        'https://login.microsoftonline.com/common/oauth2/v2.0/token',
+        new URLSearchParams({
+          client_id: CONFIG.clientId,
+          refresh_token: process.env.REFRESH_TOKEN,
+          grant_type: 'refresh_token'
+        }),
+        { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+      );
+      return response.data.access_token;
+    } catch (err) {
+      console.error('❌ 환경변수 토큰 갱신 실패. 로컬 인증으로 전환합니다.');
+    }
+  }
+
+  // 2. 저장된 토큰 파일 로드
+  let tokens = loadTokens();
+
+  // 3. 토큰이 아예 없으면 Device Flow 실행
+  if (!tokens) {
+    console.log('⚠️ 저장된 토큰이 없습니다. 기기 인증(Device Flow)을 시작합니다.');
+    tokens = await getTokenViaDeviceFlow(); // 👈 여기서 사용자님이 만드신 함수를 호출합니다!
+    if (!tokens) throw new Error('인증에 실패했습니다.');
+    return tokens.access_token;
+  }
+
+  // 4. 토큰 만료 시 갱신 시도
+  if (Date.now() >= tokens.expires_at - 60000) {
+    console.log('🔄 토큰 만료됨. 갱신 중...');
+    const refreshed = await refreshAccessToken(tokens.refresh_token);
     
-    // 메모리에 유효한 토큰이 있으면 그대로 사용
-    if (tokens && tokens.access_token && Date.now() < tokens.expires_at - 60000) {
+    // 갱신 실패(Refresh Token 만료) 시 다시 Device Flow 실행
+    if (!refreshed) {
+      console.log('⚠️ 갱신 실패. 다시 기기 인증(Device Flow)을 진행합니다.');
+      tokens = await getTokenViaDeviceFlow();
+      if (!tokens) throw new Error('재인증 실패');
       return tokens.access_token;
     }
-    
-    // 만료됐거나 없으면 환경변수 REFRESH_TOKEN으로 갱신 시도
-    console.log('🔑 환경변수 REFRESH_TOKEN으로 갱신 중...');
-    // refreshAccessToken 함수가 문자열 토큰을 직접 받도록 확실히 처리
-    const newTokens = await refreshAccessToken(process.env.REFRESH_TOKEN);
-    
-    if (newTokens && newTokens.access_token) {
-      return newTokens.access_token;
-    }
-    
-    // 만약 환경변수로 갱신 실패 시, 에러를 던지기 전 로컬 토큰이 있는지 한 번 더 확인하게 함
-    console.log('⚠️ 환경변수 갱신 실패. 로컬 토큰 확인으로 넘어갑니다.');
-    
-    throw new Error('REFRESH_TOKEN으로 갱신 실패. Render 환경변수를 확인하세요.');
-  }
-
-  // 로컬 환경: 파일에서 토큰 로드
-  let tokens = loadTokens();
-  
-  if (!tokens) {
-    console.log('⚠️ 저장된 Token 없음. Device Flow 시작...');
-    tokens = await getTokenViaDeviceFlow();
-    if (!tokens) throw new Error('Token 발급 실패.');
-  }
-
-  if (Date.now() >= tokens.expires_at - 60000) {
-    tokens = await refreshAccessToken(tokens.refresh_token);
-    if (!tokens) throw new Error('Token 갱신 실패.');
+    return refreshed.access_token;
   }
 
   return tokens.access_token;
-}
-
-// ============================================================
-// 재고 변경 이력 로그 관리
-// ============================================================
-let memoryLogs = null;
-
-function loadLogs() {
-  if (memoryLogs) return memoryLogs;
-  try {
-    if (fs.existsSync(LOG_FILE)) {
-      const data = fs.readFileSync(LOG_FILE, 'utf8');
-      memoryLogs = JSON.parse(data);
-      return memoryLogs;
-    }
-  } catch (error) {
-    console.error('로그 파일 읽기 실패:', error.message);
-  }
-  return [];
 }
 
 function saveLogs(logs) {
@@ -234,8 +222,11 @@ async function fetchExcelFromOneDrive() {
     }
 
     const jsonData = XLSX.utils.sheet_to_json(worksheet);
-    const mappedData = jsonData.map((row, index) => {
-      // 엑셀의 열 이름을 문자열 그대로 사용하여 데이터를 가져옵니다.
+        const mappedData = jsonData.map((row, index) => {
+      // 엑셀 열 이름 중 '보관장소'를 찾습니다.
+      const rowKeys = Object.keys(row);
+      const foundKey = rowKeys.find(key => key.trim() === '보관장소');
+
       return {
         id: index + 1,
         대분류: row['대분류'] || '미분류',
@@ -246,9 +237,9 @@ async function fetchExcelFromOneDrive() {
         최소보유수량: Number(row['최소보유수량']) || 0,
         최종수정시각: row['최종수정시각'] || '',
         작업자: row['작업자'] || '',
-              용도: row['용도'] || '',
-        // ✨ 정의되지 않은 변수 에러를 막기 위해 foundStorageKey 사용
-        보관장소: foundStorageKey ? row[foundStorageKey] : '위치 미지정'
+        용도: row['용도'] || '',
+        // ✨ storageKey 대신 찾은 키(foundKey)를 사용하여 안전하게 읽어옵니다.
+        보관장소: foundKey ? row[foundKey] : '위치 미지정'
       };
     });
 
@@ -277,7 +268,8 @@ async function updateExcelOnOneDrive(data, retries = 3) {
         '최소보유수량': item.최소보유수량,
         '최종수정시각': item.최종수정시각,
         '작업자': item.작업자,
-        '용도': item.용도
+        '용도': item.용도,
+        '보관장소': item.보관장소
       })));
 
       const workbook = XLSX.utils.book_new();
@@ -519,7 +511,7 @@ app.post('/api/ai/chat', async (req, res) => {
     let inventoryData = await fetchExcelFromOneDrive();
 
     const inventoryTable = inventoryData.map(item =>
-      `- ${item.부품종류} | ${item.모델명} | 위치: ${item.보관장소 || '미지정'} | 현재: ${item.현재수량}개 | 용도: ${item.용도 || '없음'}`
+      `- ${item.부품종류} | ${item.모델명} | 적용설비: ${item.적용설비} | **현재수량: ${item.현재수량}개** | 용도: ${item.용도 || '정보 없음'} | 상태: ${item.현재수량 <= item.최소보유수량 ? '⚠️부족' : '✅정상'}`
     ).join('\n');
 
     const systemPrompt = `당신은 스페어파츠 재고 관리 AI 어시스턴트입니다.
