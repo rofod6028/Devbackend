@@ -524,11 +524,14 @@ app.post('/api/ai/chat', async (req, res) => {
 [최신 재고 현황]
 ${inventoryTable}
 
+**중요 규칙:**
+1. 사용자가 '입고' 또는 '출고'를 요청하면, 반드시 답변 가장 마지막에 아래 형식을 '정확히' 포함하세요. 
+2. 마크다운 코드 블록(\`\`\`)을 사용하지 말고 반드시 ~~~ 기호를 사용하세요.
 사용자가 부품의 용도를 물어보면 위 데이터의 '용도' 항목을 참고하여 답변하세요. 
 만약 특정 용도에 맞는 부품을 찾으면 해당 모델명을 추천해 주세요.
 입출고 명령 시 응답 맨 끝에 아래 형식 추가:
 ~~~INVENTORY_UPDATE
-{"action": "출고" 또는 "입고", "items": [{"모델명": "XXX", "수량": N}]}
+{"action": "출고", "items": [{"모델명": "정확한 모델명", "수량": 숫자}]}
 ~~~
 
 한국어로 친근하게 답변하세요.`;
@@ -559,28 +562,35 @@ ${inventoryTable}
         const { action, items } = updateData;
 
         for (const item of items) {
-  const targetItem = inventoryData.find(d => d.모델명 === item.모델명);
-  if (targetItem) {
-    if (action === '출고') targetItem.현재수량 = Math.max(0, targetItem.현재수량 - item.수량);
-    else if (action === '입고') targetItem.현재수량 += item.수량;
-    
-    targetItem.최종수정시각 = getKSTDate(); // 한국 시간 함수 사용
-// 사용자가 입력한 이름을 먼저 쓰고, 없으면 'AI(이름미상)'으로 기록
-const actualUser = req.body.user || 'AI(이름미상)';
-targetItem.작업자 = actualUser; 
+          // ✨ 수정: 공백 무시 및 대소문자 무시 매칭 (가장 중요!)
+          const targetItem = inventoryData.find(d => 
+            (d.모델명 || '').replace(/\s+/g, '').toLowerCase() === (item.모델명 || '').replace(/\s+/g, '').toLowerCase()
+          );
 
-addLog(action, targetItem, action === '입고' ? item.수량 : -item.수량, actualUser);
-  }
-}
+          if (targetItem) {
+            if (action === '출고') targetItem.현재수량 = Math.max(0, targetItem.현재수량 - item.수량);
+            else if (action === '입고') targetItem.현재수량 += item.수량;
+            
+            targetItem.최종수정시각 = getKSTDate(); 
+            const actualUser = req.body.user || 'AI(이름미상)';
+            targetItem.작업자 = actualUser; 
+
+            addLog(action, targetItem, action === '입고' ? item.수량 : -item.수량, actualUser);
+          } else {
+            // ✨ 매칭 실패 시 원인 파악을 위해 로그 출력
+            console.log(`⚠️ AI가 요청한 모델명(${item.모델명})을 찾지 못했습니다.`);
+          }
+        }
 
         const success = await updateExcelOnOneDrive(inventoryData);
         if (success) {
           inventoryUpdated = true;
           updateResult = { success: true, action, items };
         }
+        // 기호 뒤쪽 내용을 잘라내어 사용자에게는 텍스트만 보여줍니다.
         responseText = responseText.split('~~~INVENTORY_UPDATE')[0].trim();
       } catch (error) {
-        console.error('재고 업데이트 처리 실패:', error);
+        console.error('❌ AI 재고 업데이트 처리 실패:', error.message);
       }
     }
 
