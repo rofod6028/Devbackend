@@ -260,17 +260,17 @@ async function updateExcelOnOneDrive(data, retries = 3) {
       const accessToken = await getValidAccessToken();
 
       const worksheet = XLSX.utils.json_to_sheet(data.map(item => ({
-        '대분류': item.대분류,
-        '부품종류': item.부품종류,
-        '모델명': item.모델명,
-        '적용설비': item.적용설비,
-        '현재수량': item.현재수량,
-        '최소보유수량': item.최소보유수량,
-        '최종수정시각': item.최종수정시각,
-        '작업자': item.작업자,
-        '용도': item.용도,
-        '보관장소': item.보관장소
-      })));
+      '대분류': item.대분류 || '미분류',
+      '부품종류': item.부품종류 || '',
+      '모델명': item.모델명 || '',
+      '적용설비': item.적용설비 || '',
+      '현재수량': Number(item.현재수량) || 0,
+      '최소보유수량': Number(item.최소보유수량) || 0,
+      '최종수정시각': item.최종수정시각 || '',
+      '작업자': item.작업자 || '',
+      '용도': item.용도 || '',
+      '보관장소': item.보관장소 || '위치 미지정' // ✨ 엑셀 헤더와 정확히 일치해야 함
+    })));
 
       const workbook = XLSX.utils.book_new();
       XLSX.utils.book_append_sheet(workbook, worksheet, CONFIG.sheetName);
@@ -407,10 +407,24 @@ app.post('/api/inventory/update', async (req, res) => {
 
     const success = await updateExcelOnOneDrive(data);
     if (success) {
-      addLog('수정', item, 현재수량 - oldQuantity, 'API');
-      res.json({ success: true, message: '업데이트 완료', data: item });
+      // 로그를 남길 때 item 객체가 살아있는지 확인하며 안전하게 기록
+      try {
+        addLog(action || '수정', item, 현재수량 - oldQuantity, user || 'Manual');
+      } catch (logErr) {
+        console.error('로그 기록 중 오류(무시됨):', logErr.message);
+      }
+      
+      // 프론트엔드에 성공 응답을 명확히 보냄
+      return res.status(200).json({ 
+        success: true, 
+        message: '업데이트 완료', 
+        data: item 
+      });
     } else {
-      res.status(500).json({ success: false, message: 'OneDrive 업데이트 실패' });
+      return res.status(500).json({ 
+        success: false, 
+        message: 'OneDrive 업데이트 실패' 
+      });
     }
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
@@ -422,62 +436,42 @@ app.post('/api/inventory/manual-update', async (req, res) => {
     const { id, 현재수량, action, user } = req.body;
     const data = await fetchExcelFromOneDrive();
     const item = data.find(d => d.id === id);
-    if (!item) return res.status(404).json({ success: false, message: '항목을 찾을 수 없습니다.' });
+
+    if (!item) {
+      return res.status(404).json({ success: false, message: '항목을 찾을 수 없습니다.' });
+    }
 
     const oldQuantity = item.현재수량;
     item.현재수량 = 현재수량;
-    item.최종수정시각 = new Date().toLocaleString('ko-KR');
-    item.작업자 = user;
+    item.최종수정시각 = getKSTDate(); // 한국 시간 함수 사용
+    item.작업자 = user || 'Manual';
 
     const success = await updateExcelOnOneDrive(data);
+    
     if (success) {
-      addLog(action || '수정', item, 현재수량 - oldQuantity, 'Manual');
-      res.json({ success: true, message: '업데이트 완료', data: item });
+      // 로그 기록 중 에러가 나더라도 응답은 성공으로 보내도록 try-catch로 감싸기
+      try {
+        addLog(action || '수정', item, 현재수량 - oldQuantity, user || 'Manual');
+      } catch (logErr) {
+        console.error('📝 로그 기록 오류(무시됨):', logErr.message);
+      }
+
+      return res.status(200).json({ 
+        success: true, 
+        message: '업데이트 완료', 
+        data: item 
+      });
     } else {
-      res.status(500).json({ success: false, message: 'OneDrive 업데이트 실패' });
+      return res.status(500).json({ 
+        success: false, 
+        message: 'OneDrive 업데이트 실패' 
+      });
     }
   } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
+    console.error('❌ manual-update 서버 에러:', error.message);
+    return res.status(500).json({ success: false, message: error.message });
   }
-});
-
-app.get('/api/inventory/logs', (req, res) => {
-  try {
-    const { limit = 50, filter } = req.query;
-    let logs = loadLogs();
-    if (filter) logs = logs.filter(log => log.모델명.includes(filter) || log.부품종류.includes(filter));
-    logs = logs.slice(0, parseInt(limit));
-    res.json({ success: true, data: logs, total: loadLogs().length });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-app.get('/api/inventory/search', async (req, res) => {
-  try {
-    const { q } = req.query;
-    if (!q || q.trim().length < 2) return res.json({ success: true, data: [] });
-    const data = await fetchExcelFromOneDrive();
-    const searchTerm = q.toLowerCase();
-    const results = data.filter(item => {
-      const searchTerm = q.toLowerCase().replace(/\s+/g, '');
-      
-      // 검색 대상이 될 텍스트들을 하나의 덩어리로 합쳐서 검색 효율을 높입니다.
-      const targetText = [
-        item.대분류,
-        item.부품종류,
-        item.모델명,
-        item.적용설비,
-        item.용도
-      ].join('').toLowerCase().replace(/\s+/g, '');
-
-      return targetText.includes(searchTerm);
-    });
-    res.json({ success: true, data: results });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-});
+}); // 👈 여기서 함수의 중괄호가 닫혀야 합니다.
 
 app.get('/api/inventory/alerts', async (req, res) => {
   try {
@@ -507,32 +501,38 @@ app.get('/api/inventory/alerts', async (req, res) => {
 
 app.post('/api/ai/chat', async (req, res) => {
   try {
-    const { message, conversationHistory } = req.body;
+    const { message, conversationHistory, user } = req.body;
+    
+    // 1. 최신 데이터 로드 (캐시 무시)
+    invalidateCache();
     let inventoryData = await fetchExcelFromOneDrive();
 
+    // 2. AI에게 전달할 재고 현황 테이블 생성 (보관장소 포함)
     const inventoryTable = inventoryData.map(item =>
-      `- [${item.대분류}] ${item.부품종류} | ${item.모델명} | 적용설비: ${item.적용설비} | **현재수량: ${item.현재수량}개** | 용도: ${item.용도 || '정보 없음'} | 상태: ${item.현재수량 <= item.최소보유수량 ? '⚠️부족' : '✅정상'}`
+      `- [${item.대분류}] ${item.모델명} | 현재: ${item.현재수량}개 | 위치: ${item.보관장소} | 용도: ${item.용도 || '정보 없음'}`
     ).join('\n');
 
-    const systemPrompt = `당신은 스페어파츠 재고 관리 AI 어시스턴트입니다.
+    // 3. AI 지시사항 (프롬프트) 강화
+    const systemPrompt = `당신은 스마트 재고 관리 전문가입니다. 반드시 아래 [최신 재고 현황]을 근거로 답변하세요.
 
-현재 재고 현황(용도 포함):
+[최신 재고 현황]
 ${inventoryTable}
 
-수동으로 수치를 수정하는 경우도 있으므로 무조건 원본 엑셀파일의 수치를 기반으로 답변해야합니다. 
-현재수량은 무조건 원본 엑셀파일 수치가 기준입니다. 계산하지 마십시오. 
-사용자가 부품의 용도를 물어보면 위 데이터의 '용도' 항목을 참고하여 답변하세요. 
-만약 특정 용도에 맞는 부품을 찾으면 해당 모델명을 추천해 주세요.
-입출고 명령 시 응답 맨 끝에 아래 형식 추가:
-~~~INVENTORY_UPDATE
-{"action": "출고" 또는 "입고", "items": [{"모델명": "XXX", "수량": N}]}
-~~~
+[중요 규칙]
+1. 사용자가 입고(추가, 넣기)나 출고(가져가기, 빼기)를 요청하면 반드시 원본 엑셀파일의 재고를 그에 맞게 수정해야 합니다. 
+2. 당신을 통하지 않고 수동으로 수치를 변경하는 경우도 있으니 대답은 반드시 원본 엑셀파일을 기반으로 해야합니다. 당신이 계산하는것이 아닙니다.
+3. 수정 시 답변 맨 마지막에 반드시 아래의 형식을 정확하게 포함하세요.
+4. 마크다운 코드 블록(\`\`\`json)은 절대 사용하지 말고 반드시 ~~~ 기호만 사용하세요.
 
-한국어로 친근하게 답변하세요.`;
+[응답 형식 예시]
+친절한 설명 후 마지막에 아래 내용 추가:
+~~~INVENTORY_UPDATE
+{"action": "출고", "items": [{"모델명": "정확한모델명", "수량": 1}]}
+~~~`;
 
     const contents = [
       { role: 'user', parts: [{ text: systemPrompt }] },
-      { role: 'model', parts: [{ text: '네, 재고 관리를 도와드리겠습니다!' }] }
+      { role: 'model', parts: [{ text: '네, 실시간 재고 현황을 바탕으로 입출고 관리를 도와드리겠습니다!' }] }
     ];
 
     if (conversationHistory?.length > 0) {
@@ -547,43 +547,62 @@ ${inventoryTable}
     let inventoryUpdated = false;
     let updateResult = null;
 
+    // 4. AI 답변에서 명령어 추출 및 실행
     if (responseText.includes('~~~INVENTORY_UPDATE')) {
       try {
-        const jsonStart = responseText.indexOf('~~~INVENTORY_UPDATE') + '~~~INVENTORY_UPDATE'.length;
-        const jsonEnd = responseText.indexOf('~~~', jsonStart);
-        const jsonText = responseText.substring(jsonStart, jsonEnd).trim();
-        const updateData = JSON.parse(jsonText);
+        const parts = responseText.split('~~~INVENTORY_UPDATE');
+        // ✨ 수정된 부분: 배열인 parts[1]에 접근하여 split을 수행해야 합니다.
+        let jsonPart = parts[1].split('~~~')[0].trim(); 
+        
+        // 혹시라도 AI가 섞어 쓴 마크다운 제거
+        jsonPart = jsonPart.replace(/```json|```/g, ''); 
+        
+        const updateData = JSON.parse(jsonPart);
         const { action, items } = updateData;
 
         for (const item of items) {
-  const targetItem = inventoryData.find(d => d.모델명 === item.모델명);
-  if (targetItem) {
-    if (action === '출고') targetItem.현재수량 = Math.max(0, targetItem.현재수량 - item.수량);
-    else if (action === '입고') targetItem.현재수량 += item.수량;
-    
-    targetItem.최종수정시각 = getKSTDate(); // 한국 시간 함수 사용
-// 사용자가 입력한 이름을 먼저 쓰고, 없으면 'AI(이름미상)'으로 기록
-const actualUser = req.body.user || 'AI(이름미상)';
-targetItem.작업자 = actualUser; 
+          // 모델명 매칭 강화 (공백 제거 및 소문자 통일)
+          const targetItem = inventoryData.find(d => 
+            (d.modelo명 || d.모델명 || '').replace(/\s+/g, '').toLowerCase() === (item.모델명 || '').replace(/\s+/g, '').toLowerCase()
+          );
 
-addLog(action, targetItem, action === '입고' ? item.수량 : -item.수량, actualUser);
-  }
-}
+          if (targetItem) {
+            // ✨ 수량 강제 숫자 변환 (데이터 안정성)
+            const changeQty = Number(item.수량) || 0;
+            
+            if (action === '출고') targetItem.현재수량 = Math.max(0, targetItem.현재수량 - changeQty);
+            else if (action === '입고') targetItem.현재수량 += changeQty;
+            
+            targetItem.최종수정시각 = getKSTDate(); 
+            const actualUser = user || 'AI 어시스턴트';
+            targetItem.작업자 = actualUser; 
 
+            addLog(action, targetItem, action === '입고' ? changeQty : -changeQty, actualUser);
+          } else {
+            console.log(`⚠️ 모델명 매칭 실패: ${item.모델명}`);
+          }
+        }
+
+        // ✨ 정제된 전체 데이터 저장 (비동기 await 확인)
         const success = await updateExcelOnOneDrive(inventoryData);
+        
         if (success) {
           inventoryUpdated = true;
           updateResult = { success: true, action, items };
+          console.log(`✅ AI 재고 반영 성공: ${action}`);
         }
-        responseText = responseText.split('~~~INVENTORY_UPDATE')[0].trim();
+        
+        // 화면에는 기호 제외 텍스트만 노출
+        responseText = parts[0].trim();
       } catch (error) {
-        console.error('재고 업데이트 처리 실패:', error);
+        console.error('❌ AI 명령어 파싱 실패:', error.message);
       }
     }
 
     res.json({ success: true, message: responseText, inventoryUpdated, updateResult, timestamp: new Date().toISOString() });
   } catch (error) {
-    res.status(500).json({ success: false, message: 'AI 응답 오류', error: error.message });
+    console.error('❌ AI 채팅 에러:', error.message);
+    res.status(500).json({ success: false, message: 'AI 응답 오류' });
   }
 });
 
