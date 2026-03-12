@@ -538,23 +538,37 @@ app.get('/api/inventory/logs', (req, res) => {
 // ✨ 검색 기능 API 추가 (404 에러 해결용)
 app.get('/api/inventory/search', async (req, res) => {
   try {
-    const query = req.query.q ? req.query.q.toLowerCase() : '';
-    // 1. 최신 엑셀 데이터를 가져옵니다.
+    // 1. 검색어 안전하게 가져오기
+    const query = req.query.q ? String(req.query.q).toLowerCase() : '';
+    
+    // 2. 최신 엑셀 데이터 가져오기
     const data = await fetchExcelFromOneDrive();
     
-    // 2. 모델명, 부품종류, 적용설비 중 검색어가 포함된 항목만 필터링합니다.
-    const filtered = data.filter(item => 
-      (item.모델명 && item.모델명.toLowerCase().includes(query)) ||
-      (item.부품종류 && item.부품종류.toLowerCase().includes(query)) ||
-      (item.적용설비 && item.적용설비.toLowerCase().includes(query)) ||
-      (item.대분류 && item.대분류.toLowerCase().includes(query))
-    );
+    // 3. 데이터가 배열인지 확인 (안전장치)
+    if (!Array.isArray(data)) {
+      return res.json({ success: true, data: [] });
+    }
 
-    console.log(`🔍 검색 수행: "${query}" -> ${filtered.length}건 발견`);
+    // 4. 필터링 (항목이 비어있어도 에러 안 나게 처리)
+    const filtered = data.filter(item => {
+      if (!item) return false;
+      
+      const model = String(item.모델명 || '').toLowerCase();
+      const type = String(item.부품종류 || '').toLowerCase();
+      const facility = String(item.적용설비 || '').toLowerCase();
+      const mainCat = String(item.대분류 || '').toLowerCase();
+
+      return model.includes(query) || 
+             type.includes(query) || 
+             facility.includes(query) || 
+             mainCat.includes(query);
+    });
+
     res.json({ success: true, data: filtered });
   } catch (error) {
-    console.error('❌ 검색 API 에러:', error.message);
-    res.status(500).json({ success: false, message: '검색 중 오류가 발생했습니다.' });
+    // 서버 로그에 정확히 어떤 줄에서 에러 났는지 출력
+    console.error('❌ 검색 API 내부 에러:', error.stack);
+    res.status(500).json({ success: false, message: '서버 내부 오류' });
   }
 });
 app.post('/api/ai/chat', async (req, res) => {
