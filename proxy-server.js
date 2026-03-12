@@ -440,8 +440,15 @@ app.post('/api/inventory/update', async (req, res) => {
 app.post('/api/inventory/manual-update', async (req, res) => {
   try {
     const { id, 현재수량, action, user } = req.body;
-    const data = await fetchExcelFromOneDrive();
-    const item = data.find(d => d.id === id);
+const data = await fetchExcelFromOneDrive();
+
+// 💡 숫자/문자열 상관없이 비교하도록 == 사용 및 로그 추가
+const item = data.find(d => d.id == id); 
+
+if (!item) {
+  console.error(`❌ 항목 찾기 실패: 요청된 ID=${id}, 데이터 첫항목 ID=${data[0]?.id}`);
+  return res.status(404).json({ success: false, message: '항목을 찾을 수 없습니다.' });
+}
 
     if (!item) {
       return res.status(404).json({ success: false, message: '항목을 찾을 수 없습니다.' });
