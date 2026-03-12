@@ -535,6 +535,28 @@ app.get('/api/inventory/logs', (req, res) => {
     res.status(500).json({ success: false, message: error.message });
   }
 });
+// ✨ 검색 기능 API 추가 (404 에러 해결용)
+app.get('/api/inventory/search', async (req, res) => {
+  try {
+    const query = req.query.q ? req.query.q.toLowerCase() : '';
+    // 1. 최신 엑셀 데이터를 가져옵니다.
+    const data = await fetchExcelFromOneDrive();
+    
+    // 2. 모델명, 부품종류, 적용설비 중 검색어가 포함된 항목만 필터링합니다.
+    const filtered = data.filter(item => 
+      (item.모델명 && item.모델명.toLowerCase().includes(query)) ||
+      (item.부품종류 && item.부품종류.toLowerCase().includes(query)) ||
+      (item.적용설비 && item.적용설비.toLowerCase().includes(query)) ||
+      (item.대분류 && item.대분류.toLowerCase().includes(query))
+    );
+
+    console.log(`🔍 검색 수행: "${query}" -> ${filtered.length}건 발견`);
+    res.json({ success: true, data: filtered });
+  } catch (error) {
+    console.error('❌ 검색 API 에러:', error.message);
+    res.status(500).json({ success: false, message: '검색 중 오류가 발생했습니다.' });
+  }
+});
 app.post('/api/ai/chat', async (req, res) => {
   try {
     const { message, conversationHistory, user } = req.body;
@@ -599,27 +621,36 @@ if (responseText.includes('~~~INVENTORY_UPDATE')) {
     const { action, items } = updateData;
 
     for (const item of items) {
-      // 매핑 로직 강화 (문자열 강제 변환 및 공백 제거)
-      const targetItem = inventoryData.find(d => 
-        String(d.모델명 || '').replace(/\s+/g, '').toLowerCase() === 
-        String(item.모델명 || '').replace(/\s+/g, '').toLowerCase()
-      );
+  const targetItem = inventoryData.find(d => 
+    String(d.모델명 || '').replace(/\s+/g, '').toLowerCase() === 
+    String(item.모델명 || '').replace(/\s+/g, '').toLowerCase()
+  );
 
-      if (targetItem) {
-        const changeQty = Number(item.수량) || 0;
-        if (action === '출고') targetItem.현재수량 = Math.max(0, targetItem.현재수량 - changeQty);
-        else if (action === '입고') targetItem.현재수량 += changeQty;
-        
-        targetItem.최종수정시각 = getKSTDate();
-        targetItem.작업자 = user || 'AI 어시스턴트';
-        console.log(`✅ 매칭 성공: ${targetItem.모델명} -> 변경후 ${targetItem.현재수량}개`);
-      } else {
-        console.error(`⚠️ 매칭 실패: 엑셀에서 [${item.모델명}]을 찾을 수 없습니다.`);
-      }
+  if (targetItem) {
+    const changeQty = Number(item.수량) || 0;
+    const oldQty = targetItem.현재수량; // 변경 전 수량 기억
+
+    if (action === '출고') targetItem.현재수량 = Math.max(0, targetItem.현재수량 - changeQty);
+    else if (action === '입고') targetItem.현재수량 += changeQty;
+    
+    targetItem.최종수정시각 = getKSTDate();
+    targetItem.작업자 = user || 'AI 어시스턴트';
+
+    // ✨ 핵심: 여기에 addLog를 추가해야 AI 변경 이력이 남습니다!
+    // 출고는 마이너스(-), 입고는 플러스(+)로 수량 변화를 기록합니다.
+    const finalChange = action === '출고' ? -changeQty : changeQty;
+    
+    try {
+      addLog(action, targetItem, finalChange, user || 'AI 어시스턴트');
+      console.log(`📝 AI 로그 기록 성공: ${targetItem.모델명}`);
+    } catch (logErr) {
+      console.error('❌ AI 로그 기록 실패:', logErr.message);
     }
+  }
+}
 
-    // 전송 결과 로그 확인
-    const success = await updateExcelOnOneDrive(inventoryData);
+// 그 후 엑셀 업데이트 실행
+const success = await updateExcelOnOneDrive(inventoryData);
     console.log("💾 OneDrive 저장 시도 결과:", success ? "성공" : "실패");
     
     if (success) {
