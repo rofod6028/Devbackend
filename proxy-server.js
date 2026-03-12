@@ -181,7 +181,18 @@ function addLog(action, item, quantityChange, user = 'System') {
   saveLogs(logs);
   console.log(`📝 로그: ${action} - ${item.모델명} (${quantityChange > 0 ? '+' : ''}${quantityChange})`);
 }
-
+// [추가할 코드 1] 로그 파일을 읽어오는 함수
+function loadLogs() {
+  try {
+    if (fs.existsSync(LOG_FILE)) {
+      const data = fs.readFileSync(LOG_FILE, 'utf8');
+      return JSON.parse(data);
+    }
+  } catch (error) {
+    console.error('❌ 로그 파일 읽기 실패:', error.message);
+  }
+  return []; // 파일이 없으면 빈 목록 반환
+}
 // ============================================================
 // OneDrive 엑셀 파일 읽기/쓰기
 // ============================================================
@@ -511,7 +522,16 @@ app.get('/api/inventory/alerts', async (req, res) => {
     res.status(500).json({ success: false, message: error.message });
   }
 });
-
+// [추가할 코드 2] 프론트엔드에 로그 데이터를 보내주는 통로
+app.get('/api/inventory/logs', (req, res) => {
+  try {
+    const logs = loadLogs(); 
+    const limit = parseInt(req.query.limit) || 100;
+    res.json({ success: true, data: logs.slice(0, limit) });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
 app.post('/api/ai/chat', async (req, res) => {
   try {
     const { message, conversationHistory, user } = req.body;
