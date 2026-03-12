@@ -185,19 +185,16 @@ function addLog(action, item, quantityChange, user = 'System') {
 }
 // [추가할 코드 1] 로그 파일을 읽어오는 함수
 function loadLogs() {
-  // 1. 메모리에 최신 데이터가 있다면 그것을 즉시 반환 (실시간 반영의 핵심)
-  if (memoryLogs && memoryLogs.length > 0) return memoryLogs;
-
   try {
+    // 파일이 없으면 에러를 내지 말고 빈 배열([])을 반환하게 함
     if (fs.existsSync(LOG_FILE)) {
       const data = fs.readFileSync(LOG_FILE, 'utf8');
-      memoryLogs = JSON.parse(data);
-      return memoryLogs;
+      return JSON.parse(data);
     }
   } catch (error) {
     console.error('❌ 로그 읽기 실패:', error.message);
   }
-  return [];
+  return []; // 파일이 없거나 오류 시 빈 목록 반환
 }
 // ============================================================
 // OneDrive 엑셀 파일 읽기/쓰기
