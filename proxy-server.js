@@ -25,7 +25,9 @@ const CONFIG = {
 };
 
 const TOKEN_FILE = path.join(__dirname, 'onedrive_tokens.json');
-const LOG_FILE = path.join(__dirname, 'inventory_logs.json');
+// 현재 실행 중인 폴더의 'inventory_logs.json'을 확실히 지칭
+const LOG_FILE = path.resolve(__dirname, 'inventory_logs.json');
+let memoryLogs = []; // 서버 메모리에 최신 로그를 들고 있게 합니다.
 
 // ============================================================
 // Gemini AI 설정
@@ -151,13 +153,13 @@ async function getValidAccessToken() {
 }
 
 function saveLogs(logs) {
-  memoryLogs = logs;
-  if (!process.env.RENDER) {
-    try {
-      fs.writeFileSync(LOG_FILE, JSON.stringify(logs, null, 2));
-    } catch (error) {
-      console.error('로그 파일 저장 실패:', error.message);
-    }
+  memoryLogs = logs; // 메모리에 즉시 반영 (프론트엔드에서 바로 보이게 함)
+  
+  // Render 환경이 아닐 때만 파일로 저장 (Render는 재배포 시 파일이 날아가므로 메모리가 더 중요함)
+  try {
+    fs.writeFileSync(LOG_FILE, JSON.stringify(logs, null, 2));
+  } catch (error) {
+    console.error('❌ 로그 저장 실패:', error.message);
   }
 }
 
@@ -183,15 +185,19 @@ function addLog(action, item, quantityChange, user = 'System') {
 }
 // [추가할 코드 1] 로그 파일을 읽어오는 함수
 function loadLogs() {
+  // 1. 메모리에 최신 데이터가 있다면 그것을 즉시 반환 (실시간 반영의 핵심)
+  if (memoryLogs && memoryLogs.length > 0) return memoryLogs;
+
   try {
     if (fs.existsSync(LOG_FILE)) {
       const data = fs.readFileSync(LOG_FILE, 'utf8');
-      return JSON.parse(data);
+      memoryLogs = JSON.parse(data);
+      return memoryLogs;
     }
   } catch (error) {
-    console.error('❌ 로그 파일 읽기 실패:', error.message);
+    console.error('❌ 로그 읽기 실패:', error.message);
   }
-  return []; // 파일이 없으면 빈 목록 반환
+  return [];
 }
 // ============================================================
 // OneDrive 엑셀 파일 읽기/쓰기
