@@ -17,35 +17,27 @@ app.use(express.json());
 // 환경 설정 (환경변수 우선, 없으면 직접 입력값 사용)
 // ============================================================
 const CONFIG = {
-  clientId: process.env.CLIENT_ID || '5454a185-bc04-4e74-9597-e2305dd67d36',
-  clientSecret: process.env.CLIENT_SECRET || 'Se98Q~SelMSaSB.Euko66Qqcny7wgcpuWy10ZbB0',
+  clientId: process.env.CLIENT_ID,
+  clientSecret: process.env.CLIENT_SECRET,
   redirectUri: process.env.REDIRECT_URI || 'http://localhost:5000/callback',
-  excelFileName: process.env.EXCEL_FILE_NAME || '재고관리.xlsx',
-  sheetName: process.env.SHEET_NAME || '재고관리'
+  excelFileName: isProd ? '재고관리.xlsx' : '재고관리(개발중).xlsx',
+  inventorySheets: ['충전', '타정', '제조', '공통'],
+  logSheetName: '사용내역종합'
 };
 
 const TOKEN_FILE = path.join(__dirname, 'onedrive_tokens.json');
-// 현재 실행 중인 폴더의 'inventory_logs.json'을 확실히 지칭
 const LOG_FILE = path.resolve(__dirname, 'inventory_logs.json');
-let memoryLogs = []; // 서버 메모리에 최신 로그를 들고 있게 합니다.
 
-// ============================================================
-// Gemini AI 설정
-// ============================================================
+let memoryLogs = [];
+let memoryTokens = null;
+
 const genAI = new GoogleGenerativeAI(
   process.env.GEMINI_API_KEY || 'AIzaSyAkak8ZMrUHwGV01nPw69QCs1qnfwipZiA'
 );
 const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
 
-// ============================================================
-// Token 관리 - 메모리 캐시 추가
-// ============================================================
-let memoryTokens = null; // Render용 메모리 저장
-
 function loadTokens() {
-  // 메모리에 있으면 메모리 우선
   if (memoryTokens) return memoryTokens;
-  
   try {
     if (fs.existsSync(TOKEN_FILE)) {
       const data = fs.readFileSync(TOKEN_FILE, 'utf8');
@@ -58,10 +50,7 @@ function loadTokens() {
 }
 
 function saveTokens(tokens) {
-  // 항상 메모리에 저장
   memoryTokens = tokens;
-  
-  // Render 환경이 아닐 때만 파일에도 저장
   if (!process.env.RENDER) {
     try {
       fs.writeFileSync(TOKEN_FILE, JSON.stringify(tokens, null, 2));
@@ -163,13 +152,14 @@ function saveLogs(logs) {
   }
 }
 
+// [수정된 addLog] : 이제 로그를 엑셀 시트 데이터에 추가합니다.
 function addLog(action, item, quantityChange, user = 'System') {
-  const logs = loadLogs();
+  // 1. 새로운 로그 객체 생성 (기존 형식 유지)
   const newLog = {
     id: uuidv4(),
-    timestamp: new Date().toISOString(),
-    timestampKR: getKSTDate(), // 한국 시간 함수 사용
+    timestampKR: getKSTDate(),
     action,
+    원본시트: item.원본시트 || '미분류',
     부품종류: item.부품종류,
     모델명: item.모델명,
     적용설비: item.적용설비,
@@ -211,16 +201,16 @@ function invalidateCache() {
 async function fetchExcelFromOneDrive() {
   const now = Date.now();
   if (cachedData && lastFetchTime && (now - lastFetchTime) < CACHE_DURATION) {
-    console.log('📦 캐시된 데이터 사용');
+    console.log('📦 캐시된 통합 데이터 사용');
     return cachedData;
   }
 
   try {
     const accessToken = await getValidAccessToken();
-    console.log(`📥 OneDrive에서 "${CONFIG.excelFileName}" 다운로드 중...`);
+    console.log(`📥 OneDrive에서 "${CONFIG.excelFileName}" 전체 시트 다운로드 중...`);
 
     const response = await axios.get(
-      `https://graph.microsoft.com/v1.0/me/drive/root:/${CONFIG.excelFileName}:/content`,
+      `https://graph.microsoft.com/v1.0/me/drive/root:/${encodeURIComponent(CONFIG.excelFileName)}:/content`,
       {
         headers: { 'Authorization': `Bearer ${accessToken}` },
         responseType: 'arraybuffer'
@@ -228,70 +218,88 @@ async function fetchExcelFromOneDrive() {
     );
 
     const workbook = XLSX.read(Buffer.from(response.data), { type: 'buffer' });
-    const worksheet = workbook.Sheets[CONFIG.sheetName];
+    let allMappedData = [];
 
-    if (!worksheet) {
-      console.error(`❌ 시트 "${CONFIG.sheetName}" 없음`);
-      return getDummyData();
-    }
+    // ✨ 재고 시트 순회 (충전, 타정, 제조, 공통)
+    CONFIG.inventorySheets.forEach(sheetName => {
+      const worksheet = workbook.Sheets[sheetName];
+      if (!worksheet) return;
 
-    const jsonData = XLSX.utils.sheet_to_json(worksheet);
-        const mappedData = jsonData.map((row, index) => {
-      // 엑셀 열 이름 중 '보관장소'를 찾습니다.
-      const rowKeys = Object.keys(row);
-      const foundKey = rowKeys.find(key => key.trim() === '보관장소');
+      const jsonData = XLSX.utils.sheet_to_json(worksheet);
+      const mappedData = jsonData.map((row, index) => {
+        const rowKeys = Object.keys(row);
+        const foundKey = rowKeys.find(key => key.trim() === '보관장소');
 
-      return {
-        id: index + 1,
-        대분류: row['대분류'] || '미분류',
-        부품종류: row['부품종류'] || '',
-        모델명: row['모델명'] || '',
-        적용설비: row['적용설비'] || '',
-        현재수량: Number(row['현재수량']) || 0,
-        최소보유수량: Number(row['최소보유수량']) || 0,
-        최종수정시각: row['최종수정시각'] || '',
-        작업자: row['작업자'] || '',
-        용도: row['용도'] || '',
-        // ✨ storageKey 대신 찾은 키(foundKey)를 사용하여 안전하게 읽어옵니다.
-        보관장소: foundKey ? row[foundKey] : '위치 미지정'
-      };
+        return {
+          id: `${sheetName}_${index + 1}`,
+          원본시트: sheetName, 
+          대분류: row['대분류'] || '미분류',
+          부품종류: row['부품종류'] || '',
+          모델명: row['모델명'] || '',
+          적용설비: row['적용설비'] || '',
+          현재수량: Number(row['현재수량']) || 0,
+          최소보유수량: Number(row['최소보유수량']) || 0,
+          최종수정시각: row['최종수정시각'] || '',
+          작업자: row['작업자'] || '',
+          용도: row['용도'] || '',
+          보관장소: foundKey ? row[foundKey] : '위치 미지정'
+        };
+      });
+      allMappedData = [...allMappedData, ...mappedData];
     });
 
-    cachedData = mappedData;
+    // ✨ 로그 시트 로드 (사용내역종합)
+    const logWorksheet = workbook.Sheets[CONFIG.logSheetName];
+    if (logWorksheet) {
+      const logJson = XLSX.utils.sheet_to_json(logWorksheet);
+      // 최신 로그가 위로 오게 역순으로 메모리에 로드 (최대 1000개)
+      memoryLogs = logJson.reverse().slice(0, 1000);
+      console.log(`📜 로그 시트 로드 완료: ${memoryLogs.length}건`);
+    }
+
+    cachedData = allMappedData;
     lastFetchTime = now;
-    console.log(`✅ OneDrive 데이터 로드 완료: ${mappedData.length}건`);
-    return mappedData;
+    console.log(`🚀 데이터 통합 완료: 총 ${allMappedData.length}건`);
+    return allMappedData;
 
   } catch (error) {
-    console.error('❌ OneDrive 읽기 실패:', error.response?.data || error.message);
+    console.error('❌ OneDrive 읽기 실패:', error.message);
     return getDummyData();
   }
 }
-
 async function updateExcelOnOneDrive(data, retries = 3) {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
       const accessToken = await getValidAccessToken();
-
-      const worksheet = XLSX.utils.json_to_sheet(data.map(item => ({
-      '대분류': item.대분류 || '미분류',
-      '부품종류': item.부품종류 || '',
-      '모델명': item.모델명 || '',
-      '적용설비': item.적용설비 || '',
-      '현재수량': Number(item.현재수량) || 0,
-      '최소보유수량': Number(item.최소보유수량) || 0,
-      '최종수정시각': item.최종수정시각 || '',
-      '작업자': item.작업자 || '',
-      '용도': item.용도 || '',
-      '보관장소': item.보관장소 || '위치 미지정' // ✨ 엑셀 헤더와 정확히 일치해야 함
-    })));
-
       const workbook = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(workbook, worksheet, CONFIG.sheetName);
+
+      // ✨ 1. 재고 시트들 저장 (충전, 타정, 제조, 공통)
+      CONFIG.inventorySheets.forEach(sheetName => {
+        const sheetData = data.filter(item => item.원본시트 === sheetName);
+        const excelRows = sheetData.map(item => ({
+          '대분류': item.대분류 || '미분류',
+          '부품종류': item.부품종류 || '',
+          '모델명': item.모델명 || '',
+          '적용설비': item.적용설비 || '',
+          '현재수량': Number(item.현재수량) || 0,
+          '최소보유수량': Number(item.최소보유수량) || 0,
+          '최종수정시각': item.최종수정시각 || '',
+          '작업자': item.작업자 || '',
+          '용도': item.용도 || '',
+          '보관장소': item.보관장소 || '위치 미지정'
+        }));
+        XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(excelRows), sheetName);
+      });
+
+      // ✨ 2. 로그 시트 저장 (사용내역종합)
+      // 엑셀에는 다시 시간순(오래된 순)으로 저장하기 위해 reverse()
+      const logRows = [...memoryLogs].reverse(); 
+      XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(logRows), CONFIG.logSheetName);
+
       const excelBuffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
 
       await axios.put(
-        `https://graph.microsoft.com/v1.0/me/drive/root:/${CONFIG.excelFileName}:/content`,
+        `https://graph.microsoft.com/v1.0/me/drive/root:/${encodeURIComponent(CONFIG.excelFileName)}:/content`,
         excelBuffer,
         {
           headers: {
@@ -301,21 +309,13 @@ async function updateExcelOnOneDrive(data, retries = 3) {
         }
       );
 
-      console.log('✅ OneDrive 업데이트 완료!');
+      console.log(`✅ OneDrive 업데이트 완료! (${CONFIG.excelFileName})`);
       invalidateCache();
       return true;
 
     } catch (error) {
-      const errorCode = error.response?.data?.error?.code;
-      const errorDetail = error.response?.data?.error?.message;
-      
-      // 상세 로그 출력 (이게 핵심입니다!)
-      console.error(`❌ OneDrive 쓰기 실패 (${attempt}/${retries})`);
-      console.error(`❌ 에러 코드: ${errorCode}`);
-      console.error(`❌ 상세 메시지: ${errorDetail || error.message}`);
-
-      if ((errorCode === 'notAllowed' || errorCode === 'resourceLocked') && attempt < retries) {
-        console.log("🔄 파일이 잠겨있거나 권한 문제로 재시도합니다...");
+      console.error(`❌ OneDrive 쓰기 실패 (${attempt}/${retries}): ${error.message}`);
+      if (attempt < retries) {
         await new Promise(resolve => setTimeout(resolve, attempt * 2000));
         continue;
       }
@@ -579,33 +579,33 @@ app.post('/api/ai/chat', async (req, res) => {
     invalidateCache();
     let inventoryData = await fetchExcelFromOneDrive();
 
-    // 2. AI에게 전달할 재고 현황 테이블 생성 (보관장소 포함)
+    // 2. AI에게 전달할 재고 현황 테이블 생성 (시트 정보 추가)
     const inventoryTable = inventoryData.map(item =>
-      `- [${item.대분류}] ${item.모델명} | 현재: ${item.현재수량}개 | 위치: ${item.보관장소} | 용도: ${item.용도 || '정보 없음'}`
+      `- [${item.원본시트} / ${item.대분류}] ${item.모델명} | 현재: ${item.현재수량}개 | 위치: ${item.보관장소}`
     ).join('\n');
 
-    // 3. AI 지시사항 (프롬프트) 강화
-    const systemPrompt = `당신은 스마트 재고 관리 전문가입니다. 현재수량은 반드시 아래 [최신 재고 현황]을 근거로 답변하세요.
+    // 3. AI 지시사항 (프롬프트) 강화: 원본시트(Sheet) 개념 주입
+    const systemPrompt = `당신은 스마트 재고 관리 전문가입니다. 반드시 아래 [최신 재고 현황]을 근거로 답변하세요.
 
 [최신 재고 현황]
 ${inventoryTable}
 
 [중요 지시]
-1. 이전 대화 내용에 적힌 수량은 무시하십시오. 오직 아래 제공된 [최신 실시간 재고 현황]의 수량만 정답으로 간주합니다.
-2. 사용자가 수동으로 수치를 변경했으므로, 당신의 이전 답변과 현재 수량이 달라도 [최신 현황]을 기준으로 답변하십시오.
-3. 입출고 처리 후에는 반드시 원본 데이터의 수치를 당신이 직접 계산하지 말고, 수정 명령(INVENTORY_UPDATE)만 내리십시오.
-4. 수정 시 답변 맨 마지막에 반드시 아래의 형식을 정확하게 포함하세요.
-5. 마크다운 코드 블록(\`\`\`json)은 절대 사용하지 말고 반드시 ~~~ 기호만 사용하세요.
+1. 답변 시 반드시 해당 부품이 속한 "원본시트(충전, 타정, 공통)" 정보를 확인하십시오.
+2. 입출고 처리 시 모델명뿐만 아니라 반드시 "원본시트" 이름을 JSON 명령에 포함해야 합니다.
+3. 수정 명령(INVENTORY_UPDATE) 형식에 "원본시트" 필드를 반드시 추가하십시오.
+4. 마크다운 코드 블록(\`\`\`json)은 절대 사용하지 말고 반드시 ~~~ 기호만 사용하세요.
+5. 상식을 뛰어넘는 요청(예: 한 번에 50개 이상 변동 등)을 할 경우 사용자에게 두 번 더 확인하십시오.
 
 [응답 형식 예시]
 친절한 설명 후 마지막에 아래 내용 추가:
 ~~~INVENTORY_UPDATE
-{"action": "출고", "items": [{"모델명": "정확한모델명", "수량": 1}]}
+{"action": "출고", "items": [{"모델명": "정확한모델명", "수량": 1, "원본시트": "충전"}]}
 ~~~`;
 
     const contents = [
       { role: 'user', parts: [{ text: systemPrompt }] },
-      { role: 'model', parts: [{ text: '네, 실시간 재고 현황을 바탕으로 입출고 관리를 도와드리겠습니다!' }] }
+      { role: 'model', parts: [{ text: '네, 시트별(충전/타정/공통) 실시간 재고 현황을 바탕으로 정확히 도와드리겠습니다!' }] }
     ];
 
     if (conversationHistory?.length > 0) {
@@ -620,64 +620,44 @@ ${inventoryTable}
     let inventoryUpdated = false;
     let updateResult = null;
 
-    // 4. AI 답변에서 명령어 추출 및 실행
-if (responseText.includes('~~~INVENTORY_UPDATE')) {
-  console.log("🤖 AI가 재고 수정 명령을 보냈습니다. 분석을 시작합니다...");
-  try {
-    const parts = responseText.split('~~~INVENTORY_UPDATE');
-    if (!parts[1]) throw new Error("AI 응답 형식이 올바르지 않습니다. (구분자 부족)");
+    // 4. AI 답변에서 명령어 추출 및 실행 (시트 필터링 로직 추가)
+    if (responseText.includes('~~~INVENTORY_UPDATE')) {
+      try {
+        const parts = responseText.split('~~~INVENTORY_UPDATE');
+        let jsonPart = parts[1].split('~~~')[0].trim();
+        jsonPart = jsonPart.replace(/```json|```/g, ''); 
+        
+        const updateData = JSON.parse(jsonPart);
+        const { action, items } = updateData;
 
-    let jsonPart = parts[1].split('~~~')[0].trim();
-    jsonPart = jsonPart.replace(/```json|```/g, ''); // 마크다운 제거
-    
-    console.log("📝 파싱할 JSON 데이터:", jsonPart);
-    const updateData = JSON.parse(jsonPart);
-    const { action, items } = updateData;
+        for (const item of items) {
+          // 💡 수정 포인트: 모델명과 원본시트가 모두 일치하는 항목을 찾습니다.
+          const targetItem = inventoryData.find(d => 
+            String(d.모델명 || '').replace(/\s+/g, '').toLowerCase() === String(item.모델명 || '').replace(/\s+/g, '').toLowerCase() &&
+            d.원본시트 === item.원본시트
+          );
 
-    for (const item of items) {
-  const targetItem = inventoryData.find(d => 
-    String(d.모델명 || '').replace(/\s+/g, '').toLowerCase() === 
-    String(item.모델명 || '').replace(/\s+/g, '').toLowerCase()
-  );
+          if (targetItem) {
+            const changeQty = Number(item.수량) || 0;
+            const finalChange = action === '출고' ? -changeQty : changeQty;
 
-  if (targetItem) {
-    const changeQty = Number(item.수량) || 0;
-    const oldQty = targetItem.현재수량; // 변경 전 수량 기억
+            targetItem.현재수량 = action === '출고' ? Math.max(0, targetItem.현재수량 - changeQty) : targetItem.현재수량 + changeQty;
+            targetItem.최종수정시각 = getKSTDate();
+            targetItem.작업자 = user || 'AI 어시스턴트';
 
-    if (action === '출고') targetItem.현재수량 = Math.max(0, targetItem.현재수량 - changeQty);
-    else if (action === '입고') targetItem.현재수량 += changeQty;
-    
-    targetItem.최종수정시각 = getKSTDate();
-    targetItem.작업자 = user || 'AI 어시스턴트';
+            addLog(action, targetItem, finalChange, user || 'AI 어시스턴트');
+          }
+        }
 
-    // ✨ 핵심: 여기에 addLog를 추가해야 AI 변경 이력이 남습니다!
-    // 출고는 마이너스(-), 입고는 플러스(+)로 수량 변화를 기록합니다.
-    const finalChange = action === '출고' ? -changeQty : changeQty;
-    
-    try {
-      addLog(action, targetItem, finalChange, user || 'AI 어시스턴트');
-      console.log(`📝 AI 로그 기록 성공: ${targetItem.모델명}`);
-    } catch (logErr) {
-      console.error('❌ AI 로그 기록 실패:', logErr.message);
+        const success = await updateExcelOnOneDrive(inventoryData);
+        if (success) {
+          inventoryUpdated = true;
+          updateResult = { success: true, action, items };
+        }
+      } catch (error) {
+        console.error('❌ AI 명령 처리 오류:', error.message);
+      }
     }
-  }
-}
-
-// 그 후 엑셀 업데이트 실행
-const success = await updateExcelOnOneDrive(inventoryData);
-    console.log("💾 OneDrive 저장 시도 결과:", success ? "성공" : "실패");
-    
-    if (success) {
-      inventoryUpdated = true;
-      updateResult = { success: true, action, items };
-    }
-  } catch (error) {
-    console.error('❌ AI 반영 프로세스 중 오류 발생:', error.message);
-    console.error('❌ 에러 상세 내용:', error.stack);
-  }
-} else {
-  console.log("💡 AI 답변에 수정 명령이 포함되지 않았습니다.");
-}
 
     res.json({ success: true, message: responseText, inventoryUpdated, updateResult, timestamp: new Date().toISOString() });
   } catch (error) {
