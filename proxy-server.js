@@ -209,24 +209,6 @@ function invalidateCache() {
   lastFetchTime = null;
 }
 
-// OneDrive 공유 링크를 다운로드 가능한 URL로 변환
-function convertOneDriveLinkToDownload(shareLink) {
-  if (!shareLink) return null;
-  
-  // 이미 download=1이 포함되어 있으면 그대로 반환
-  if (shareLink.includes('download=1')) {
-    return shareLink;
-  }
-  
-  // ?e= 파라미터가 있으면 그 뒤에 &download=1 추가
-  if (shareLink.includes('?e=')) {
-    return shareLink + '&download=1';
-  }
-  
-  // 쿼리 파라미터가 없으면 ?download=1 추가
-  return shareLink + '?download=1';
-}
-
 async function fetchExcelFromOneDrive() {
   const now = Date.now();
   if (cachedData && lastFetchTime && (now - lastFetchTime) < CACHE_DURATION) {
@@ -235,17 +217,15 @@ async function fetchExcelFromOneDrive() {
   }
 
   try {
-    // 공유 링크를 다운로드 가능한 URL로 변환
-    const downloadLink = convertOneDriveLinkToDownload(CONFIG.oneDriveLink);
-    console.log(`📥 OneDrive 공유 링크에서 다운로드 시작`);
-    console.log(`   원본 링크: ${CONFIG.oneDriveLink.substring(0, 80)}...`);
-    console.log(`   변환된 링크: ${downloadLink.substring(0, 80)}...`);
+    // 환경변수에서 온드라이브 링크 가져오기 (이미 ?download=1이 포함되어 있어야 함)
+    console.log(`📥 OneDrive 파일 다운로드 시작`);
+    console.log(`   링크: ${CONFIG.oneDriveLink.substring(0, 80)}...`);
     console.log(`   파일: ${CONFIG.excelFileName}`);
     
-    const response = await axios.get(downloadLink, {
+    const response = await axios.get(CONFIG.oneDriveLink, {
       responseType: 'arraybuffer',
-      timeout: 15000,
-      maxRedirects: 10,
+      timeout: 20000,
+      maxRedirects: 15,
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
       }
