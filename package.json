@@ -2,9 +2,9 @@
   "name": "devbackend",
   "version": "1.0.0",
   "description": "Smart Inventory Backend API",
-  "main": "proxy-server.js",
+  "main": "server_onedrive.js",
   "scripts": {
-    "start": "node proxy-server.js"
+    "start": "node server_onedrive.js"
   },
   "dependencies": {
     "@google/generative-ai": "^0.24.1",
