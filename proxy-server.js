@@ -19,10 +19,15 @@ app.use(express.json());
 // 환경 설정 (환경변수 우선, 없으면 직접 입력값 사용)
 // ============================================================
 const CONFIG = {
+  // OneDrive 공유 링크 (환경변수 우선)
+  oneDriveLink: process.env.ONEDRIVE_EXCEL_LINK || 'https://1drv.ms/x/c/a4af552d7a74f298/IQAwK-ebaAloSIBuWExbnuYDAYjR10qVN1JeX0Ps9WRd970?e=SedRJi',
+  excelFileName: process.env.EXCEL_FILE_NAME || '재고관리(개발중).xlsx',
+  
+  // OAuth 설정 (선택사항)
   clientId: process.env.CLIENT_ID,
   clientSecret: process.env.CLIENT_SECRET,
   redirectUri: process.env.REDIRECT_URI || 'http://localhost:5000/callback',
-  excelFileName: '재고관리(개발중).xlsx',
+  
   inventorySheets: ['충전', '타정', '제조', '공통'],
   logSheetName: '사용내역종합'
 };
@@ -206,16 +211,17 @@ async function fetchExcelFromOneDrive() {
   }
 
   try {
-    const accessToken = await getValidAccessToken();
-    console.log(`📥 OneDrive에서 "${CONFIG.excelFileName}" 전체 시트 다운로드 중...`);
-
-    const response = await axios.get(
-      `https://graph.microsoft.com/v1.0/me/drive/root:/${encodeURIComponent(CONFIG.excelFileName)}:/content`,
-      {
-        headers: { 'Authorization': `Bearer ${accessToken}` },
-        responseType: 'arraybuffer'
+    // 공유 링크로 직접 다운로드 (OAuth 불필요)
+    console.log(`📥 OneDrive 공유 링크에서 "${CONFIG.excelFileName}" 다운로드 중...`);
+    
+    const response = await axios.get(CONFIG.oneDriveLink, {
+      responseType: 'arraybuffer',
+      timeout: 15000,
+      maxRedirects: 10,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
       }
-    );
+    });
 
     const workbook = XLSX.read(Buffer.from(response.data), { type: 'buffer' });
     let allMappedData = [];
@@ -223,9 +229,14 @@ async function fetchExcelFromOneDrive() {
     // ✨ 재고 시트 순회 (충전, 타정, 제조, 공통)
     CONFIG.inventorySheets.forEach(sheetName => {
       const worksheet = workbook.Sheets[sheetName];
-      if (!worksheet) return;
+      if (!worksheet) {
+        console.warn(`⚠️ 시트 "${sheetName}"을 찾을 수 없습니다`);
+        return;
+      }
 
       const jsonData = XLSX.utils.sheet_to_json(worksheet);
+      console.log(`✅ "${sheetName}" 시트: ${jsonData.length}개 항목`);
+      
       const mappedData = jsonData.map((row, index) => {
         const rowKeys = Object.keys(row);
         const foundKey = rowKeys.find(key => key.trim() === '보관장소');
@@ -252,19 +263,19 @@ async function fetchExcelFromOneDrive() {
     const logWorksheet = workbook.Sheets[CONFIG.logSheetName];
     if (logWorksheet) {
       const logJson = XLSX.utils.sheet_to_json(logWorksheet);
-      // 최신 로그가 위로 오게 역순으로 메모리에 로드 (최대 1000개)
       memoryLogs = logJson.reverse().slice(0, 1000);
       console.log(`📜 로그 시트 로드 완료: ${memoryLogs.length}건`);
     }
 
     cachedData = allMappedData;
     lastFetchTime = now;
-    console.log(`🚀 데이터 통합 완료: 총 ${allMappedData.length}건`);
+    console.log(`✅ 데이터 로드 완료: 총 ${allMappedData.length}건`);
     return allMappedData;
 
   } catch (error) {
-    console.error('❌ OneDrive 읽기 실패:', error.message);
-    return getDummyData();
+    console.error('❌ OneDrive 다운로드 실패:', error.message);
+    console.error('💡 해결책: Render 환경변수에 ONEDRIVE_EXCEL_LINK가 올바르게 설정되어 있는지 확인하세요');
+    return [];
   }
 }
 async function updateExcelOnOneDrive(data, retries = 3) {
