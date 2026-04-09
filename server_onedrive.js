@@ -9,6 +9,8 @@ const path = require('path');
 const app = express();
 const PORT = 3001; // 기존 포트 유지
 
+const isProd = process.env.NODE_ENV === 'production';
+
 app.use(cors());
 app.use(express.json());
 
@@ -16,11 +18,12 @@ app.use(express.json());
 // 환경 설정
 // ============================================================
 const CONFIG = {
-  clientId: '5454a185-bc04-4e74-9597-e2305dd67d36',
-  clientSecret: 'Se98Q~SelMSaSB.Euko66Qqcny7wgcpuWy10ZbB0',
-  redirectUri: 'http://localhost:3001/callback',
-  excelFileName: '재고관리.xlsx',
-  sheetName: '재고관리'
+  clientId: process.env.CLIENT_ID || '5454a185-bc04-4e74-9597-e2305dd67d36',
+  clientSecret: process.env.CLIENT_SECRET,
+  redirectUri: process.env.REDIRECT_URI || 'http://localhost:3001/callback',
+  excelFileName: '재고관리(개발중).xlsx',
+  inventorySheets: ['충전', '타정', '제조', '공통'],
+  logSheetName: '사용내역종합'
 };
 
 const TOKEN_FILE = path.join(__dirname, 'onedrive_tokens.json');
@@ -28,7 +31,7 @@ const TOKEN_FILE = path.join(__dirname, 'onedrive_tokens.json');
 // ============================================================
 // Gemini AI 설정
 // ============================================================
-const genAI = new GoogleGenerativeAI('AIzaSyAkak8ZMrUHwGV01nPw69QCs1qnfwipZiA');
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
 
 // ============================================================
@@ -151,27 +154,35 @@ async function fetchExcelFromOneDrive() {
   try {
     const accessToken = await getValidAccessToken();
     const response = await axios.get(
-      `https://graph.microsoft.com{CONFIG.excelFileName}:/content`,
+      `https://graph.microsoft.com/v1.0/me/drive/root:/${CONFIG.excelFileName}:/content`,
       { headers: { 'Authorization': `Bearer ${accessToken}` }, responseType: 'arraybuffer' }
     );
 
     const workbook = XLSX.read(Buffer.from(response.data), { type: 'buffer' });
-    const worksheet = workbook.Sheets[CONFIG.sheetName];
-    const jsonData = XLSX.utils.sheet_to_json(worksheet);
+    let allData = [];
 
-    return jsonData.map((row, index) => ({
-      id: index + 1,
-      대분류: row['대분류'] || '미분류', // 대분류 유지
-      부품종류: row['부품종류'] || '',
-      모델명: row['모델명'] || '',
-      적용설비: row['적용설비'] || '',
-      현재수량: Number(row['현재수량']) || 0,
-      최소보유수량: Number(row['최소보유수량']) || 0,
-      최종수정시각: row['최종수정시각'] || '',
-      작업자: row['작업자'] || '', // 작업자 유지
-      용도: row['용도'] || '', // 용도 유지
-      보관장소: row['보관장소'] || '위치 미지정' // ✨ 보관장소 추가
-    }));
+    for (const sheetName of CONFIG.inventorySheets) {
+      if (workbook.Sheets[sheetName]) {
+        const worksheet = workbook.Sheets[sheetName];
+        const jsonData = XLSX.utils.sheet_to_json(worksheet);
+        const mappedData = jsonData.map((row, index) => ({
+          id: allData.length + index + 1,
+          대분류: row['대분류'] || sheetName, // 시트 이름을 대분류로 사용
+          부품종류: row['부품종류'] || '',
+          모델명: row['모델명'] || '',
+          적용설비: row['적용설비'] || '',
+          현재수량: Number(row['현재수량']) || 0,
+          최소보유수량: Number(row['최소보유수량']) || 0,
+          최종수정시각: row['최종수정시각'] || '',
+          작업자: row['작업자'] || '',
+          용도: row['용도'] || '',
+          보관장소: row['보관장소'] || '위치 미지정'
+        }));
+        allData = allData.concat(mappedData);
+      }
+    }
+
+    return allData;
   } catch (error) {
     console.error('로드 실패:', error.message);
     return [];
@@ -191,15 +202,15 @@ async function updateExcelOnOneDrive(data) {
       '최종수정시각': item.최종수정시각,
       '작업자': item.작업자,
       '용도': item.용도,
-      '보관장소': item.보관장소 // ✨ 저장 시에도 보관장소 유지
+      '보관장소': item.보관장소
     })));
 
     const workbook = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(workbook, worksheet, CONFIG.sheetName);
+    XLSX.utils.book_append_sheet(workbook, worksheet, '충전'); // 첫 번째 시트에 저장
     const excelBuffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
 
     await axios.put(
-      `https://graph.microsoft.com{CONFIG.excelFileName}:/content`,
+      `https://graph.microsoft.com/v1.0/me/drive/root:/${CONFIG.excelFileName}:/content`,
       excelBuffer,
       {
         headers: {
