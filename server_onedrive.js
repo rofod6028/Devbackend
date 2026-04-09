@@ -223,13 +223,71 @@ async function updateExcelOnOneDrive(data) {
     );
     return true;
   } catch (error) {
+    console.error('Excel 쓰기 실패:', error.message);
     return false;
+  }
+}
+
+function searchInventory(data, query) {
+  const lower = String(query || '').trim().toLowerCase();
+  return data.filter(item =>
+    [item.대분류, item.부품종류, item.모델명, item.적용설비, item.보관장소, item.원본시트]
+      .some(value => String(value || '').toLowerCase().includes(lower))
+  );
+}
+
+function findItemCoordinatesById(workbook, itemId) {
+  let nextId = 1;
+  for (const sheetName of CONFIG.inventorySheets) {
+    const sheet = workbook.Sheets[sheetName];
+    if (!sheet) continue;
+
+    const rows = XLSX.utils.sheet_to_json(sheet, { header: 1 });
+    const headers = rows[0] || [];
+    const qtyIndex = headers.indexOf('현재수량');
+    if (qtyIndex === -1) continue;
+
+    for (let rowIndex = 1; rowIndex < rows.length; rowIndex++) {
+      if (nextId === itemId) {
+        return { sheetName, rowIndex, qtyIndex };
+      }
+      nextId += 1;
+    }
+  }
+  return null;
+}
+
+function writeQuantityToWorkbook(workbook, coordinates, quantity) {
+  const sheet = workbook.Sheets[coordinates.sheetName];
+  const cellAddress = XLSX.utils.encode_cell({ c: coordinates.qtyIndex, r: coordinates.rowIndex });
+  sheet[cellAddress] = { t: 'n', v: Number(quantity) };
+}
+
+function readLogSheet(workbook) {
+  const sheet = workbook.Sheets[CONFIG.logSheetName];
+  if (!sheet) return [];
+  return XLSX.utils.sheet_to_json(sheet);
+}
+
+function appendLogEntry(workbook, entry) {
+  const existingLogs = readLogSheet(workbook);
+  const nextLogs = [...existingLogs, entry];
+
+  const logSheet = XLSX.utils.json_to_sheet(nextLogs);
+  if (!workbook.SheetNames.includes(CONFIG.logSheetName)) {
+    XLSX.utils.book_append_sheet(workbook, logSheet, CONFIG.logSheetName);
+  } else {
+    workbook.Sheets[CONFIG.logSheetName] = logSheet;
   }
 }
 
 // ============================================================
 // API Routes (최신 기능 포함)
 // ============================================================
+
+app.get('/', (req, res) => {
+  res.send({ success: true, message: 'Devbackend is running', port: PORT });
+});
 
 app.get('/api/inventory', async (req, res) => {
   const data = await fetchExcelFromOneDrive();
@@ -269,6 +327,64 @@ app.get('/api/inventory/category/:category', async (req, res) => {
     item.대분류 === category || item.원본시트 === category || item.적용설비 === category
   );
   res.json({ success: true, data: filtered });
+});
+
+app.get('/api/inventory/search', async (req, res) => {
+  const query = req.query.q || '';
+  const data = await fetchExcelFromOneDrive();
+  const results = searchInventory(data, query);
+  res.json({ success: true, data: results });
+});
+
+app.post('/api/inventory/manual-update', async (req, res) => {
+  try {
+    const { id, 현재수량, action, user } = req.body;
+    const accessToken = await getValidAccessToken();
+    const response = await axios.get(
+      `https://graph.microsoft.com/v1.0/me/drive/root:/${CONFIG.excelFileName}:/content`,
+      { headers: { Authorization: `Bearer ${accessToken}` }, responseType: 'arraybuffer' }
+    );
+    const workbook = XLSX.read(Buffer.from(response.data), { type: 'buffer' });
+    const coordinates = findItemCoordinatesById(workbook, id);
+    if (!coordinates) {
+      return res.status(404).json({ success: false, message: 'Item not found' });
+    }
+
+    writeQuantityToWorkbook(workbook, coordinates, 현재수량);
+    appendLogEntry(workbook, {
+      날짜: new Date().toISOString(),
+      user: user || 'unknown',
+      action: action || 'manual-update',
+      itemId: id,
+      quantity: 현재수량
+    });
+
+    const saved = await writeWorkbookToOneDrive(workbook);
+    if (!saved) {
+      return res.status(500).json({ success: false, message: 'Excel 저장에 실패했습니다.' });
+    }
+
+    res.json({ success: true, message: '재고가 업데이트되었습니다.' });
+  } catch (error) {
+    console.error('manual-update 실패:', error.message);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get('/api/inventory/logs', async (req, res) => {
+  try {
+    const accessToken = await getValidAccessToken();
+    const response = await axios.get(
+      `https://graph.microsoft.com/v1.0/me/drive/root:/${CONFIG.excelFileName}:/content`,
+      { headers: { Authorization: `Bearer ${accessToken}` }, responseType: 'arraybuffer' }
+    );
+    const workbook = XLSX.read(Buffer.from(response.data), { type: 'buffer' });
+    const logs = readLogSheet(workbook);
+    res.json({ success: true, data: logs.slice(0, Number(req.query.limit || 100)) });
+  } catch (error) {
+    console.error('logs 조회 실패:', error.message);
+    res.status(500).json({ success: false, message: error.message });
+  }
 });
 
 app.post('/api/ai/chat', async (req, res) => {
