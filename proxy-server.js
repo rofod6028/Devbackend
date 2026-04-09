@@ -32,6 +32,12 @@ const CONFIG = {
   logSheetName: '사용내역종합'
 };
 
+// 환경변수 로딩 상태 로깅
+console.log('📋 환경변수 설정 상태:');
+console.log(`   OneDrive Link: ${CONFIG.oneDriveLink ? '✅ 설정됨' : '❌ 미설정'}`);
+console.log(`   Excel File: ${CONFIG.excelFileName ? '✅ 설정됨' : '❌ 미설정'}`);
+console.log(`   Gemini Key: ${process.env.GEMINI_API_KEY ? '✅ 설정됨' : '❌ 미설정'}`);
+
 const TOKEN_FILE = path.join(__dirname, 'onedrive_tokens.json');
 const LOG_FILE = path.resolve(__dirname, 'inventory_logs.json');
 
@@ -212,7 +218,9 @@ async function fetchExcelFromOneDrive() {
 
   try {
     // 공유 링크로 직접 다운로드 (OAuth 불필요)
-    console.log(`📥 OneDrive 공유 링크에서 "${CONFIG.excelFileName}" 다운로드 중...`);
+    console.log(`📥 OneDrive 공유 링크에서 다운로드 시작`);
+    console.log(`   링크: ${CONFIG.oneDriveLink.substring(0, 80)}...`);
+    console.log(`   파일: ${CONFIG.excelFileName}`);
     
     const response = await axios.get(CONFIG.oneDriveLink, {
       responseType: 'arraybuffer',
@@ -273,8 +281,17 @@ async function fetchExcelFromOneDrive() {
     return allMappedData;
 
   } catch (error) {
-    console.error('❌ OneDrive 다운로드 실패:', error.message);
-    console.error('💡 해결책: Render 환경변수에 ONEDRIVE_EXCEL_LINK가 올바르게 설정되어 있는지 확인하세요');
+    console.error('❌ OneDrive 다운로드 실패');
+    console.error(`   에러 메시지: ${error.message}`);
+    if (error.response) {
+      console.error(`   HTTP 상태: ${error.response.status}`);
+      console.error(`   응답 데이터: ${error.response.statusText}`);
+    }
+    console.error(`   사용한 링크: ${CONFIG.oneDriveLink.substring(0, 80)}...`);
+    console.error('💡 해결책:');
+    console.error('   1. Render 환경변수 ONEDRIVE_EXCEL_LINK 확인');
+    console.error('   2. 링크가 정말 공유 링크인지 확인');
+    console.error('   3. 링크를 다시 생성해서 시도해보세요');
     return [];
   }
 }
