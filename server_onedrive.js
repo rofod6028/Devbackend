@@ -7,9 +7,10 @@ const fs = require('fs');
 const path = require('path');
 
 const app = express();
-const PORT = 3001; // 기존 포트 유지
+const PORT = process.env.PORT || 3001;
 
 const isProd = process.env.NODE_ENV === 'production';
+console.log(`▶ 서버 포트 설정: ${PORT} (process.env.PORT=${process.env.PORT || 'undefined'})`);
 
 app.use(cors());
 app.use(express.json());
