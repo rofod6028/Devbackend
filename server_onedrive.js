@@ -168,6 +168,7 @@ async function fetchExcelFromOneDrive() {
         const jsonData = XLSX.utils.sheet_to_json(worksheet);
         const mappedData = jsonData.map((row, index) => ({
           id: allData.length + index + 1,
+          원본시트: sheetName,
           대분류: row['대분류'] || sheetName, // 시트 이름을 대분류로 사용
           부품종류: row['부품종류'] || '',
           모델명: row['모델명'] || '',
@@ -244,6 +245,30 @@ app.get('/api/inventory/summary', async (req, res) => {
     categoryBreakdown: {}
   };
   res.json({ success: true, data: summary });
+});
+
+function buildAlerts(data) {
+  return data
+    .map(item => ({
+      ...item,
+      긴급도: item.현재수량 <= 0 ? 'critical' : item.현재수량 <= item.최소보유수량 ? 'warning' : 'normal'
+    }))
+    .filter(item => item.최소보유수량 > 0 && item.현재수량 <= item.최소보유수량);
+}
+
+app.get('/api/inventory/alerts', async (req, res) => {
+  const data = await fetchExcelFromOneDrive();
+  const alerts = buildAlerts(data);
+  res.json({ success: true, data: alerts });
+});
+
+app.get('/api/inventory/category/:category', async (req, res) => {
+  const data = await fetchExcelFromOneDrive();
+  const category = decodeURIComponent(req.params.category);
+  const filtered = data.filter(item =>
+    item.대분류 === category || item.원본시트 === category || item.적용설비 === category
+  );
+  res.json({ success: true, data: filtered });
 });
 
 app.post('/api/ai/chat', async (req, res) => {
