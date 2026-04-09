@@ -1,18 +1,22 @@
 {
-  "name": "onedrive-proxy",
+  "name": "devbackend",
   "version": "1.0.0",
-  "description": "Simple CORS proxy for OneDrive",
-  "main": "proxy-server.js",
+  "description": "Smart Inventory Backend API",
+  "main": "server.js",
   "scripts": {
-    "start": "node proxy-server.js"
+    "start": "node server.js"
   },
   "dependencies": {
     "@google/generative-ai": "^0.24.1",
     "axios": "^1.13.4",
     "cors": "^2.8.6",
-    "express": "^4.22.1",
+    "express": "^4.18.2",
     "uuid": "^13.0.0",
     "xlsx": "^0.18.5"
+  },
+  "engines": {
+    "node": "20.x",
+    "npm": "10.x"
   },
   "keywords": [],
   "author": "",
