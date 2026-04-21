@@ -211,7 +211,7 @@ async function fetchExcelFromOneDrive() {
     console.log(`📥 OneDrive에서 "${CONFIG.excelFileName}" 다운로드 중...`);
 
     const response = await axios.get(
-      `https://graph.microsoft.com/v1.0/me/drive/root:/${encodeURIComponent(CONFIG.excelFileName)}:/content`,
+      `https://graph.microsoft.com/v1.0/me/drive/root:/${CONFIG.excelFileName}:/content`,
       {
         headers: { 'Authorization': `Bearer ${accessToken}` },
         responseType: 'arraybuffer'
@@ -304,7 +304,7 @@ async function updateExcelOnOneDrive(data, retries = 3) {
       const excelBuffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
 
       await axios.put(
-        `https://graph.microsoft.com/v1.0/me/drive/root:/${encodeURIComponent(CONFIG.excelFileName)}:/content`,
+        `https://graph.microsoft.com/v1.0/me/drive/root:/${CONFIG.excelFileName}:/content`,
         excelBuffer,
         {
           headers: {
