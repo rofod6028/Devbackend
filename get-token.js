@@ -9,7 +9,7 @@ async function getToken() {
 
   // 1. Device Code 요청
   const deviceCodeResponse = await axios.post(
-    'https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode',
+    'https://login.microsoftonline.com/common/oauth2/v2.0/devicecode',
     new URLSearchParams({
       client_id: CLIENT_ID,
       scope: 'Files.ReadWrite Files.ReadWrite.All offline_access'
@@ -40,7 +40,7 @@ async function getToken() {
 
     try {
       const tokenResponse = await axios.post(
-        'https://login.microsoftonline.com/consumers/oauth2/v2.0/token',
+        'https://login.microsoftonline.com/common/oauth2/v2.0/token',
         new URLSearchParams({
           client_id: CLIENT_ID,
           grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
@@ -63,7 +63,7 @@ async function getToken() {
       console.log('====================================================');
       console.log(tokens.refresh_token);
       console.log('====================================================');
-      console.log('\n👆 위 값을 복사해서 Render 환경변수에 넣으세요!\n');
+      console.log('\n👆 위 값을 복사해서 Render 환경변수 REFRESH_TOKEN에 넣으세요!\n');
       return;
 
     } catch (err) {
