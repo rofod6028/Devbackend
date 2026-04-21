@@ -2,12 +2,10 @@
   "name": "devbackend",
   "version": "1.0.0",
   "description": "Smart Inventory Backend API",
-  {
   "main": "proxy-server.js",
   "scripts": {
     "start": "node proxy-server.js"
-  }
-}
+  },
   "dependencies": {
     "@google/generative-ai": "^0.24.1",
     "axios": "^1.13.4",
