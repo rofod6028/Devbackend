@@ -1,7 +1,7 @@
 const axios = require('axios');
 const fs = require('fs');
 
-const CLIENT_ID = '5454a185-bc04-4e74-9597-e2305dd67d36';
+const CLIENT_ID = '6e3b85ad-a49b-4259-ae1e-bcb870e41474';
 const TOKEN_FILE = './onedrive_tokens.json';
 
 async function getToken() {
