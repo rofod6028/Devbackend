@@ -69,16 +69,22 @@ function saveTokens(tokens) {
   }
 }
 
-async function refreshAccessToken(refreshToken) {
+async function refreshAccessToken(refreshToken, clientIdOverride) {
+  const clientId = clientIdOverride || CONFIG.clientId;
   try {
     console.log('🔄 Access Token 갱신 중...');
+    const params = {
+      client_id: clientId,
+      refresh_token: refreshToken,
+      grant_type: 'refresh_token'
+    };
+    // client_secret이 있으면 포함
+    if (CONFIG.clientSecret) {
+      params.client_secret = CONFIG.clientSecret;
+    }
     const response = await axios.post(
       'https://login.microsoftonline.com/common/oauth2/v2.0/token',
-      new URLSearchParams({
-        client_id: CONFIG.clientId,
-        refresh_token: refreshToken,
-        grant_type: 'refresh_token'
-      }),
+      new URLSearchParams(params),
       { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
     );
 
@@ -101,18 +107,30 @@ async function getValidAccessToken() {
   if (process.env.REFRESH_TOKEN) {
     try {
       console.log('🔑 환경변수 REFRESH_TOKEN으로 갱신 중...');
+      const params = {
+        client_id: CONFIG.clientId,
+        refresh_token: process.env.REFRESH_TOKEN,
+        grant_type: 'refresh_token'
+      };
+      if (CONFIG.clientSecret) {
+        params.client_secret = CONFIG.clientSecret;
+      }
       const response = await axios.post(
         'https://login.microsoftonline.com/common/oauth2/v2.0/token',
-        new URLSearchParams({
-          client_id: CONFIG.clientId,
-          refresh_token: process.env.REFRESH_TOKEN,
-          grant_type: 'refresh_token'
-        }),
+        new URLSearchParams(params),
         { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
       );
-      return response.data.access_token;
+      const newTokens = {
+        access_token: response.data.access_token,
+        refresh_token: response.data.refresh_token || process.env.REFRESH_TOKEN,
+        expires_at: Date.now() + (response.data.expires_in * 1000)
+      };
+      saveTokens(newTokens);
+      console.log('✅ 환경변수 REFRESH_TOKEN으로 갱신 성공!');
+      return newTokens.access_token;
     } catch (err) {
-      console.error('❌ 환경변수 토큰 갱신 실패. 로컬 인증으로 전환합니다.');
+      console.error('❌ 환경변수 토큰 갱신 실패:', err.response?.data || err.message);
+      console.log('📁 로컬 저장 토큰으로 전환합니다...');
     }
   }
 
@@ -146,6 +164,7 @@ async function getValidAccessToken() {
 // 로그 관리
 // ============================================================
 function loadLogs() {
+  if (memoryLogs && memoryLogs.length > 0) return memoryLogs;
   try {
     if (fs.existsSync(LOG_FILE)) {
       const data = fs.readFileSync(LOG_FILE, 'utf8');
