@@ -417,11 +417,12 @@ async function fetchExcelFromOneDrive() {
       allMappedData = [...allMappedData, ...mappedData];
     });
 
-    // 로그 시트 로드 (사용내역종합)
+    // 로그 시트 로드 (사용내역종합) — memoryLogs가 이미 있으면 덮어쓰지 않음
     const logWorksheet = workbook.Sheets[CONFIG.logSheetName];
-    if (logWorksheet) {
+    if (logWorksheet && memoryLogs.length === 0) {
       const logJson = XLSX.utils.sheet_to_json(logWorksheet);
-      memoryLogs = logJson.reverse().slice(0, 1000);
+      // 오래된 순 저장 → 최신순으로 reverse, 상한 없이 전체 보관
+      memoryLogs = logJson.reverse();
       console.log(`📜 로그 시트 로드 완료: ${memoryLogs.length}건`);
     }
 
@@ -800,9 +801,24 @@ app.get('/api/inventory/alerts', async (req, res) => {
 
 app.get('/api/inventory/logs', (req, res) => {
   try {
-    const logs = loadLogs();
-    const limit = parseInt(req.query.limit) || 100;
-    res.json({ success: true, data: logs.slice(0, limit) });
+    let logs = loadLogs();
+    const limit    = parseInt(req.query.limit)  || 100;
+    const offset   = parseInt(req.query.offset) || 0;
+    const facility = req.query.facility ? String(req.query.facility) : null;
+    const partType = req.query.partType ? String(req.query.partType) : null;
+
+    if (facility) {
+      logs = logs.filter(l =>
+        String(l.적용설비 || '').includes(facility) ||
+        String(l.표준설비명 || '').includes(facility)
+      );
+    }
+    if (partType) {
+      logs = logs.filter(l => String(l.부품종류 || '') === partType);
+    }
+
+    const total = logs.length;
+    res.json({ success: true, data: logs.slice(offset, offset + limit), total });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -876,6 +892,46 @@ app.get('/api/inventory/search', async (req, res) => {
   }
 });
 
+// ============================================================
+// 방안C: 공통부품 출고 — 실제 사용 설비 포함 처리
+// POST /api/inventory/common-update
+// body: { id, 현재수량, action, user, 실제사용설비 }
+// ============================================================
+app.post('/api/inventory/common-update', async (req, res) => {
+  try {
+    const { id, 현재수량, action, user, 실제사용설비 } = req.body;
+
+    if (!실제사용설비) {
+      return res.status(400).json({ success: false, message: '공통부품 출고 시 실제사용설비는 필수입니다.' });
+    }
+
+    const data = await fetchExcelFromOneDrive();
+    const item = data.find(d => d.id == id);
+    if (!item) return res.status(404).json({ success: false, message: '항목을 찾을 수 없습니다.' });
+
+    const oldQuantity = item.현재수량;
+    item.현재수량 = 현재수량;
+    item.최종수정시각 = getKSTDate();
+    item.작업자 = user || 'Manual';
+
+    const success = await updateExcelOnOneDrive(data);
+    if (success) {
+      // 로그에는 실제 설비명 기록
+      const logItem = { ...item, 적용설비: 실제사용설비, 표준설비명: 실제사용설비, isCommonPart: true };
+      addLog(action || '출고', logItem, 현재수량 - oldQuantity, user || 'Manual');
+      addFacilityLog(action || '출고', logItem, 현재수량 - oldQuantity, user || 'Manual');
+      checkAndNotifyLowStock(data);
+      console.log(`🏭 공통부품 출고 기록 — ${item.모델명} → 실제설비: ${실제사용설비}`);
+      return res.status(200).json({ success: true, message: '공통부품 출고 완료', data: item });
+    } else {
+      return res.status(500).json({ success: false, message: 'OneDrive 업데이트 실패' });
+    }
+  } catch (error) {
+    console.error('❌ common-update 에러:', error.message);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 app.post('/api/ai/chat', async (req, res) => {
   try {
     const { message, conversationHistory, user } = req.body;
@@ -883,11 +939,49 @@ app.post('/api/ai/chat', async (req, res) => {
     invalidateCache();
     let inventoryData = await fetchExcelFromOneDrive();
 
+    // 공통부품 목록 추출 (isCommonPart 또는 적용설비에 '공통' 포함)
+    const commonItems = inventoryData.filter(item =>
+      item.isCommonPart || String(item.적용설비 || '').includes('공통')
+    );
+    const commonItemsList = commonItems.length > 0
+      ? commonItems.map(item => `  · ${item.모델명} (${item.부품종류}, ${item.원본시트}시트)`).join('\n')
+      : '  (없음)';
+
     const inventoryTable = inventoryData.map(item =>
-      `- [${item.원본시트} / ${item.대분류}] ${item.모델명} | 현재: ${item.현재수량}개 | 위치: ${item.보관장소}`
+      `- [${item.원본시트}/${item.isCommonPart ? '공통부품' : item.적용설비}] ${item.모델명} | ${item.부품종류} | 현재: ${item.현재수량}개 | 위치: ${item.보관장소}`
     ).join('\n');
 
-    const systemPrompt = `당신은 스마트 재고 관리 전문가입니다. 반드시 아래 [최신 재고 현황]을 근거로 답변하세요.\n\n[최신 재고 현황]\n${inventoryTable}\n\n[중요 지시]\n1. 답변 시 반드시 해당 부품이 속한 "원본시트(충전, 타정, 공통)" 정보를 확인하십시오.\n2. 입출고 처리 시 모델명뿐만 아니라 반드시 "원본시트" 이름을 JSON 명령에 포함해야 합니다.\n3. 수정 명령(INVENTORY_UPDATE) 형식에 "원본시트" 필드를 반드시 추가하십시오.\n4. 마크다운 코드 블록(\`\`\`json)은 절대 사용하지 말고 반드시 ~~~ 기호만 사용하세요.\n5. 상식을 뛰어넘는 요청(예: 한 번에 50개 이상 변동 등)을 할 경우 사용자에게 두 번 더 확인하십시오.\n\n[응답 형식 예시]\n친절한 설명 후 마지막에 아래 내용 추가:\n~~~INVENTORY_UPDATE\n{"action": "출고", "items": [{"모델명": "정확한모델명", "수량": 1, "원본시트": "충전"}]}\n~~~`;
+    const systemPrompt = `당신은 스마트 재고 관리 전문가입니다. 반드시 아래 [최신 재고 현황]을 근거로 답변하세요.
+
+[최신 재고 현황]
+${inventoryTable}
+
+[공통부품 목록 — 여러 설비에서 공유하는 부품]
+${commonItemsList}
+
+[중요 지시]
+1. 답변 시 반드시 해당 부품이 속한 "원본시트(충전, 타정, 공통)" 정보를 확인하십시오.
+2. 입출고 처리 시 모델명뿐만 아니라 반드시 "원본시트" 이름을 JSON 명령에 포함해야 합니다.
+3. 수정 명령(INVENTORY_UPDATE) 형식에 "원본시트" 필드를 반드시 추가하십시오.
+4. 마크다운 코드 블록(\`\`\`json)은 절대 사용하지 말고 반드시 ~~~ 기호만 사용하세요.
+5. 상식을 뛰어넘는 요청(예: 한 번에 50개 이상 변동 등)을 할 경우 사용자에게 두 번 더 확인하십시오.
+
+[공통부품 출고 규칙 — 반드시 준수]
+6. 위 [공통부품 목록]에 있는 부품을 "출고" 처리할 때는, 반드시 실제 사용 설비명을 사용자에게 먼저 물어보고 확인받은 후에만 INVENTORY_UPDATE 명령을 생성하십시오.
+7. 공통부품 출고 시 사용자가 설비명을 아직 말하지 않았다면, JSON 명령 없이 아래와 같이 질문만 하십시오:
+   "어느 설비에 사용하실 예정인가요? (예: 립스틱충전기#1 / 립스틱충전기#2)"
+8. 사용자가 설비명을 확인해 준 경우, INVENTORY_UPDATE JSON의 "실제사용설비" 필드에 해당 설비명을 반드시 포함하십시오.
+
+[응답 형식 예시 — 일반 부품]
+친절한 설명 후 마지막에 아래 내용 추가:
+~~~INVENTORY_UPDATE
+{"action": "출고", "items": [{"모델명": "정확한모델명", "수량": 1, "원본시트": "충전"}]}
+~~~
+
+[응답 형식 예시 — 공통부품 (설비 확인 후)]
+~~~INVENTORY_UPDATE
+{"action": "출고", "items": [{"모델명": "정확한모델명", "수량": 1, "원본시트": "공통", "실제사용설비": "립스틱충전기#1"}]}
+~~~`;
 
     const contents = [
       { role: 'user', parts: [{ text: systemPrompt }] },
@@ -927,8 +1021,18 @@ app.post('/api/ai/chat', async (req, res) => {
             targetItem.현재수량 = action === '출고' ? Math.max(0, targetItem.현재수량 - changeQty) : targetItem.현재수량 + changeQty;
             targetItem.최종수정시각 = getKSTDate();
             targetItem.작업자 = user || 'AI 어시스턴트';
-            addLog(action, targetItem, finalChange, user || 'AI 어시스턴트');
-            addFacilityLog(action, targetItem, finalChange, user || 'AI 어시스턴트');
+
+            // 공통부품인 경우 실제사용설비를 이력에 반영
+            const logItem = { ...targetItem };
+            if (item.실제사용설비) {
+              logItem.적용설비 = item.실제사용설비;
+              logItem.표준설비명 = item.실제사용설비;
+              logItem.isCommonPart = true;
+              console.log(`🏭 공통부품 실제 사용 설비: ${item.실제사용설비}`);
+            }
+
+            addLog(action, logItem, finalChange, user || 'AI 어시스턴트');
+            addFacilityLog(action, logItem, finalChange, user || 'AI 어시스턴트');
           }
         }
 
