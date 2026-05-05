@@ -1097,6 +1097,23 @@ ${realFacilities.join(', ')}
         const updateData = JSON.parse(jsonPart);
         const { action, items } = updateData;
 
+        // ── 백엔드 안전망: 공통 시트 출고인데 실제사용설비 없으면 강제 차단 ──
+        if (action === '출고') {
+          const missingFacilityItems = items.filter(item => {
+            if (item.원본시트 !== '공통') return false;          // 공통 시트 부품만 체크
+            return !item.실제사용설비 || !item.실제사용설비.trim(); // 설비명 누락 여부
+          });
+
+          if (missingFacilityItems.length > 0) {
+            // 설비명 없이 처리 시도 차단 — 재고 변경 없이 질문만 반환
+            const modelNames = missingFacilityItems.map(i => i.모델명).join(', ');
+            const facilityExamples = realFacilities.slice(0, 3).join(' / ');
+            const clarifyMsg = `⚠️ **${modelNames}**은(는) 공통 부품입니다.\n어느 설비에 사용하실 예정인가요?\n(예: ${facilityExamples})`;
+            console.log(`🚫 공통부품 설비 미확인 차단: ${modelNames}`);
+            return res.json({ success: true, message: clarifyMsg, inventoryUpdated: false, updateResult: null, timestamp: new Date().toISOString() });
+          }
+        }
+
         for (const item of items) {
           const targetItem = inventoryData.find(d =>
             String(d.모델명 || '').replace(/\s+/g, '').toLowerCase() === String(item.모델명 || '').replace(/\s+/g, '').toLowerCase() &&
