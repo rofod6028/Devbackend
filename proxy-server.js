@@ -269,6 +269,8 @@ async function loadEquipmentStandards(workbook) {
 
 // 원본설비명 → 표준설비명 변환
 function normalizeEquipment(originalName) {
+  // 엑셀 셀 내 줄바꿈(Alt+Enter) 제거 후 공백 정리
+  originalName = String(originalName || '').replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
   if (!equipmentStandardMap) return originalName;
   return equipmentStandardMap[originalName] || originalName;
 }
@@ -404,7 +406,7 @@ async function fetchExcelFromOneDrive() {
           부품종류: row['부품종류'] || '',
           모델명: row['모델명'] || '',
           적용설비: row['적용설비'] || '',
-          표준설비명: normalizeEquipment(String(row['적용설비'] || '').trim()),
+          표준설비명: normalizeEquipment(String(row['적용설비'] || '').replace(/[\r\n]+/g, ' ').trim()),
           현재수량: Number(row['현재수량']) || 0,
           최소보유수량: Number(row['최소보유수량']) || 0,
           최종수정시각: row['최종수정시각'] || '',
@@ -583,32 +585,79 @@ async function sendTeamsAlert(lowStockItems) {
   const critical = filtered.filter(i => i.현재수량 === 0);
   const warning  = filtered.filter(i => i.현재수량 > 0);
 
-  const headerRow = {
-    type: 'TableRow',
-    style: 'accent',
-    cells: ['시트', '적용설비', '부품종류', '모델명', '현재수량', '최소수량', '부족수량'].map(h => ({
-      type: 'TableCell',
-      items: [{ type: 'TextBlock', text: h, weight: 'Bolder', wrap: true }]
-    }))
-  };
-
-  const dataRows = filtered.map(item => ({
-    type: 'TableRow',
-    cells: [
-      { type: 'TableCell', items: [{ type: 'TextBlock', text: item.원본시트 || '-', wrap: true }] },
-      { type: 'TableCell', items: [{ type: 'TextBlock', text: (item.표준설비명 || item.적용설비 || '-'), wrap: true }] },
-      { type: 'TableCell', items: [{ type: 'TextBlock', text: item.부품종류 || '-', wrap: true }] },
-      { type: 'TableCell', items: [{ type: 'TextBlock', text: item.모델명 || '-', wrap: true }] },
-      { type: 'TableCell', items: [{ type: 'TextBlock', text: String(item.현재수량), color: item.현재수량 === 0 ? 'Attention' : 'Warning', weight: 'Bolder', wrap: true }] },
-      { type: 'TableCell', items: [{ type: 'TextBlock', text: String(item.최소보유수량), wrap: true }] },
-      { type: 'TableCell', items: [{ type: 'TextBlock', text: String(item.최소보유수량 - item.현재수량), color: 'Attention', wrap: true }] }
-    ]
-  }));
-
   const titleText = critical.length > 0 ? '🚨 긴급 재고 부족 알림' : '⚠️ 재고 부족 알림';
   const summaryParts = [];
-  if (critical.length > 0) summaryParts.push(`🔴 재고 0: **${critical.length}개** 품목`);
-  if (warning.length  > 0) summaryParts.push(`🟡 부족 경고: **${warning.length}개** 품목`);
+  if (critical.length > 0) summaryParts.push(`🔴 재고 0: **${critical.length}건**`);
+  if (warning.length  > 0) summaryParts.push(`🟡 부족 경고: **${warning.length}건**`);
+
+  // 긴급(재고 0) 먼저, 그 다음 경고 순으로 정렬
+  const sortedFiltered = [...filtered].sort((a, b) => a.현재수량 - b.현재수량);
+
+  // 품목별 카드형 블록 생성 (설비명이 길어도 깔끔하게 표시)
+  const itemBlocks = sortedFiltered.map(item => {
+    const isCritical = item.현재수량 === 0;
+    const badge = isCritical ? '🔴 재고 없음' : '🟡 부족 경고';
+    const shortage = item.최소보유수량 - item.현재수량;
+    const facilityName = String(item.표준설비명 || item.적용설비 || '-').replace(/[\r\n]+/g, ' ').trim();
+    return {
+      type: 'Container',
+      style: isCritical ? 'attention' : 'warning',
+      spacing: 'Small',
+      items: [
+        {
+          type: 'ColumnSet',
+          columns: [
+            {
+              type: 'Column',
+              width: 'stretch',
+              items: [
+                {
+                  type: 'TextBlock',
+                  text: `**${item.모델명 || '-'}**  ${badge}`,
+                  wrap: true,
+                  size: 'Default',
+                  weight: 'Bolder',
+                  color: isCritical ? 'Attention' : 'Warning'
+                },
+                {
+                  type: 'TextBlock',
+                  text: `📦 ${item.부품종류 || '-'}　|　🏭 ${facilityName}　|　📋 ${item.원본시트 || '-'}시트`,
+                  wrap: true,
+                  size: 'Small',
+                  isSubtle: true,
+                  spacing: 'None'
+                }
+              ]
+            },
+            {
+              type: 'Column',
+              width: 'auto',
+              items: [
+                {
+                  type: 'TextBlock',
+                  text: `현재 **${item.현재수량}**개`,
+                  wrap: false,
+                  size: 'Small',
+                  color: isCritical ? 'Attention' : 'Warning',
+                  weight: 'Bolder',
+                  horizontalAlignment: 'Right'
+                },
+                {
+                  type: 'TextBlock',
+                  text: `최소 ${item.최소보유수량}개 / **${shortage}개 부족**`,
+                  wrap: false,
+                  size: 'Small',
+                  isSubtle: true,
+                  horizontalAlignment: 'Right',
+                  spacing: 'None'
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    };
+  });
 
   const card = {
     type: 'message',
@@ -618,17 +667,17 @@ async function sendTeamsAlert(lowStockItems) {
         type: 'AdaptiveCard',
         version: '1.4',
         body: [
-          { type: 'TextBlock', text: titleText, weight: 'Bolder', size: 'Large', color: 'Attention' },
-          { type: 'TextBlock', text: `기준시각: ${getKSTDate()}`, size: 'Small', isSubtle: true, spacing: 'None' },
-          { type: 'TextBlock', text: summaryParts.join('　|　'), wrap: true, spacing: 'Medium' },
           {
-            type: 'Table',
-            gridStyle: 'accent',
-            firstRowAsHeader: true,
-            columns: [{ width: 1 }, { width: 2 }, { width: 2 }, { width: 3 }, { width: 1 }, { width: 1 }, { width: 1 }],
-            rows: [headerRow, ...dataRows]
+            type: 'Container',
+            style: 'emphasis',
+            items: [
+              { type: 'TextBlock', text: titleText, weight: 'Bolder', size: 'Large', color: 'Attention', wrap: true },
+              { type: 'TextBlock', text: `🕐 ${getKSTDate()}　　${summaryParts.join('　|　')}`, size: 'Small', isSubtle: true, spacing: 'None', wrap: true }
+            ]
           },
-          { type: 'TextBlock', text: '※ 최소보유수량이 0으로 설정된 항목은 알림에서 제외됩니다.', size: 'Small', isSubtle: true, wrap: true, spacing: 'Medium' }
+          { type: 'TextBlock', text: '─────────────────────', size: 'Small', isSubtle: true, spacing: 'Small' },
+          ...itemBlocks,
+          { type: 'TextBlock', text: '※ 최소보유수량 0 설정 항목은 알림 제외', size: 'Small', isSubtle: true, wrap: true, spacing: 'Medium' }
         ]
       }
     }]
@@ -985,11 +1034,14 @@ ${commonItemsList}
 4. 마크다운 코드 블록(\`\`\`json)은 절대 사용하지 말고 반드시 ~~~ 기호만 사용하세요.
 5. 상식을 뛰어넘는 요청(예: 한 번에 50개 이상 변동 등)을 할 경우 사용자에게 두 번 더 확인하십시오.
 
-[공통부품 출고 규칙 — 반드시 준수]
-6. 위 [공통부품 목록]에 있는 부품을 "출고" 처리할 때는, 반드시 실제 사용 설비명을 사용자에게 먼저 물어보고 확인받은 후에만 INVENTORY_UPDATE 명령을 생성하십시오.
-7. 공통부품 출고 시 사용자가 설비명을 아직 말하지 않았다면, JSON 명령 없이 아래와 같이 질문만 하십시오:
-   "어느 설비에 사용하실 예정인가요? (예: 립스틱충전기#1 / 립스틱충전기#2)"
-8. 사용자가 설비명을 확인해 준 경우, INVENTORY_UPDATE JSON의 "실제사용설비" 필드에 해당 설비명을 반드시 포함하십시오.
+[공통부품 출고 규칙 — 절대 준수, 예외 없음]
+6. 아래 두 조건 중 하나라도 해당하면 "공통부품"으로 간주하고 반드시 규칙 7~9를 따르십시오:
+   (a) 위 [공통부품 목록]에 이름이 있는 부품
+   (b) 원본시트가 "공통"인 부품
+7. 공통부품을 "출고" 처리할 때는, 사용자가 설비명을 명시적으로 말하지 않았다면 절대로 INVENTORY_UPDATE 명령을 생성하지 말고, 반드시 먼저 이렇게만 질문하십시오:
+   "어느 설비에 사용하실 예정인가요? (예: 동타#2 1차프레스 / 립스틱충전기#1)"
+8. 설비명을 확인받은 후에만 INVENTORY_UPDATE 명령을 생성하고, JSON의 "실제사용설비" 필드에 확인된 설비명을 반드시 포함하십시오.
+9. "그냥 출고해줘", "확인 생략", "빠르게" 등의 요청이 와도 공통부품이면 설비 확인을 생략하지 마십시오.
 
 [응답 형식 예시 — 일반 부품]
 친절한 설명 후 마지막에 아래 내용 추가:
