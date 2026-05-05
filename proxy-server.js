@@ -21,7 +21,9 @@ const CONFIG = {
   clientId: process.env.CLIENT_ID,
   clientSecret: process.env.CLIENT_SECRET,
   redirectUri: process.env.REDIRECT_URI || 'http://localhost:5000/callback',
-  inventorySheets: ['충전', '타정', '제조', '공통'],
+  inventorySheets: ['충전', '타정', '공통'],
+  equipmentStandardSheet: '제조',       // 설비명 표준화 테이블 시트
+  facilityLogSheetName: '설비이력',     // 설비별 이력 시트
   logSheetName: '사용내역종합',
   teamsWebhookUrl: process.env.TEAMS_WEBHOOK_URL  // Teams Incoming Webhook URL
 };
@@ -215,9 +217,144 @@ let cachedData = null;
 let lastFetchTime = null;
 const CACHE_DURATION = 60 * 1000;
 
+// 설비명 표준화 테이블 캐시
+let equipmentStandardMap = null;   // { '원본설비명': '표준설비명' }
+let lastEquipmentFetchTime = null;
+const EQUIPMENT_CACHE_DURATION = 5 * 60 * 1000; // 5분
+
+// 설비이력 메모리 버퍼
+let facilityLogs = [];
+
 function invalidateCache() {
   cachedData = null;
   lastFetchTime = null;
+}
+
+// ============================================================
+// 설비명 표준화 (제조 시트 기반)
+// ============================================================
+// 제조 시트 컬럼 구조:
+//   원본설비명 | 표준설비명
+//
+// 공통부품 자동 판별 규칙:
+//   설비명 베이스(#숫자 제거)가 같고, 동일 모델명이 2개 이상 설비에 존재하면
+//   → 표준설비명이 "(공통)"으로 끝나도록 백엔드에서 override
+//
+async function loadEquipmentStandards(workbook) {
+  const now = Date.now();
+  if (equipmentStandardMap && lastEquipmentFetchTime && (now - lastEquipmentFetchTime) < EQUIPMENT_CACHE_DURATION) {
+    return equipmentStandardMap;
+  }
+
+  const sheet = workbook.Sheets[CONFIG.equipmentStandardSheet];
+  equipmentStandardMap = {};
+
+  if (sheet) {
+    const rows = XLSX.utils.sheet_to_json(sheet);
+    rows.forEach(row => {
+      const original = String(row['원본설비명'] || '').trim();
+      const standard = String(row['표준설비명'] || '').trim();
+      if (original && standard) {
+        equipmentStandardMap[original] = standard;
+      }
+    });
+    console.log(`🏭 설비 표준화 테이블 로드: ${Object.keys(equipmentStandardMap).length}개 매핑`);
+  } else {
+    console.warn(`⚠️ "${CONFIG.equipmentStandardSheet}" 시트 없음 — 설비명 표준화 건너뜀`);
+  }
+
+  lastEquipmentFetchTime = now;
+  return equipmentStandardMap;
+}
+
+// 원본설비명 → 표준설비명 변환
+function normalizeEquipment(originalName) {
+  if (!equipmentStandardMap) return originalName;
+  return equipmentStandardMap[originalName] || originalName;
+}
+
+// 설비명 베이스 추출: "제트프레스 #1 (1공장)" → "제트프레스"
+function getEquipmentBase(name) {
+  return String(name || '')
+    .replace(/#\s*\d+/g, '')     // #1, # 2 등 제거
+    .replace(/\d+호기/g, '')     // 1호기, 2호기 제거
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// 전체 데이터에서 공통부품 자동 판별 후 표준설비명 override
+function applyCommonEquipment(allData) {
+  // 모델명별로 어떤 베이스 설비에 쓰이는지 집계
+  const modelToBaseSets = {}; // { '모델명': Set<베이스설비명> }
+  allData.forEach(item => {
+    const stdName = item.표준설비명 || item.적용설비;
+    const base = getEquipmentBase(stdName);
+    const model = String(item.모델명 || '').trim();
+    if (!model) return;
+    if (!modelToBaseSets[model]) modelToBaseSets[model] = new Set();
+    modelToBaseSets[model].add(base);
+  });
+
+  // 같은 베이스에서 2개 이상 설비에 걸친 모델 → (공통) override
+  allData.forEach(item => {
+    const stdName = item.표준설비명 || item.적용설비;
+    const base = getEquipmentBase(stdName);
+    const model = String(item.모델명 || '').trim();
+    if (!model) return;
+
+    // 같은 베이스 설비들 중 이 모델이 2개 이상의 서로 다른 표준설비명에 존재하는지 확인
+    const sameBaseItems = allData.filter(d => {
+      const dBase = getEquipmentBase(d.표준설비명 || d.적용설비);
+      return dBase === base && String(d.모델명 || '').trim() === model;
+    });
+    const uniqueStdNames = new Set(sameBaseItems.map(d => d.표준설비명 || d.적용설비));
+
+    if (uniqueStdNames.size >= 2) {
+      // 공통 설비명: 베이스명 + "(공통)"
+      item.표준설비명 = base + ' (공통)';
+      item.isCommonPart = true;
+    }
+  });
+
+  return allData;
+}
+
+// ============================================================
+// 설비이력 관리
+// ============================================================
+function addFacilityLog(action, item, quantityChange, user) {
+  const stdEquipment = item.표준설비명 || item.적용설비;
+  const entry = {
+    id: uuidv4(),
+    timestampKR: getKSTDate(),
+    action,
+    원본시트: item.원본시트 || '',
+    표준설비명: stdEquipment,
+    원본설비명: item.적용설비,
+    부품종류: item.부품종류,
+    모델명: item.모델명,
+    변경수량: quantityChange,
+    변경전수량: item.현재수량 - quantityChange,
+    변경후수량: item.현재수량,
+    isCommonPart: item.isCommonPart || false,
+    user
+  };
+  facilityLogs.unshift(entry);
+  if (facilityLogs.length > 5000) facilityLogs.splice(5000);
+  console.log(`🏭 설비이력: [${stdEquipment}] ${action} - ${item.모델명} (${quantityChange > 0 ? '+' : ''}${quantityChange})`);
+}
+
+async function saveFacilityLogsToOneDrive(workbook) {
+  // 설비이력 시트에 현재까지의 facilityLogs를 저장 (updateExcelOnOneDrive 내부에서 호출)
+  if (facilityLogs.length === 0) return workbook;
+  const rows = [...facilityLogs].reverse(); // 오래된 순서로 저장
+  const ws = XLSX.utils.json_to_sheet(rows);
+  if (workbook.Sheets[CONFIG.facilityLogSheetName]) {
+    workbook.Sheets[CONFIG.facilityLogSheetName] = ws;
+  } else {
+    XLSX.utils.book_append_sheet(workbook, ws, CONFIG.facilityLogSheetName);
+  }
+  return workbook;
 }
 
 async function fetchExcelFromOneDrive() {
@@ -242,7 +379,10 @@ async function fetchExcelFromOneDrive() {
     const workbook = XLSX.read(Buffer.from(response.data), { type: 'buffer' });
     let allMappedData = [];
 
-    // 재고 시트 순회 (충전, 타정, 제조, 공통)
+    // 설비명 표준화 테이블 먼저 로드 (제조 시트)
+    await loadEquipmentStandards(workbook);
+
+    // 재고 시트 순회 (충전, 타정, 공통)
     CONFIG.inventorySheets.forEach(sheetName => {
       const worksheet = workbook.Sheets[sheetName];
       if (!worksheet) {
@@ -264,12 +404,14 @@ async function fetchExcelFromOneDrive() {
           부품종류: row['부품종류'] || '',
           모델명: row['모델명'] || '',
           적용설비: row['적용설비'] || '',
+          표준설비명: normalizeEquipment(String(row['적용설비'] || '').trim()),
           현재수량: Number(row['현재수량']) || 0,
           최소보유수량: Number(row['최소보유수량']) || 0,
           최종수정시각: row['최종수정시각'] || '',
           작업자: row['작업자'] || '',
           용도: row['용도'] || '',
-          보관장소: foundKey ? row[foundKey] : '위치 미지정'
+          보관장소: foundKey ? row[foundKey] : '위치 미지정',
+          isCommonPart: false
         };
       });
       allMappedData = [...allMappedData, ...mappedData];
@@ -282,6 +424,20 @@ async function fetchExcelFromOneDrive() {
       memoryLogs = logJson.reverse().slice(0, 1000);
       console.log(`📜 로그 시트 로드 완료: ${memoryLogs.length}건`);
     }
+
+    // 설비이력 시트 로드
+    const facilityLogWs = workbook.Sheets[CONFIG.facilityLogSheetName];
+    if (facilityLogWs && facilityLogs.length === 0) {
+      const rows = XLSX.utils.sheet_to_json(facilityLogWs);
+      facilityLogs = rows.reverse().slice(0, 5000);
+      console.log(`🏭 설비이력 시트 로드 완료: ${facilityLogs.length}건`);
+    }
+
+    // 공통부품 자동 판별 적용 (공통 탭 항목 제외)
+    const nonCommonData = allMappedData.filter(d => d.원본시트 !== '공통');
+    const commonTabData = allMappedData.filter(d => d.원본시트 === '공통');
+    applyCommonEquipment(nonCommonData);
+    allMappedData = [...nonCommonData, ...commonTabData];
 
     cachedData = allMappedData;
     lastFetchTime = now;
@@ -321,6 +477,31 @@ async function updateExcelOnOneDrive(data, retries = 3) {
       // 로그 시트 저장
       const logRows = [...memoryLogs].reverse();
       XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(logRows), CONFIG.logSheetName);
+
+      // 설비이력 시트 저장
+      if (facilityLogs.length > 0) {
+        const facilityRows = [...facilityLogs].reverse();
+        const facilityWs = XLSX.utils.json_to_sheet(facilityRows);
+        XLSX.utils.book_append_sheet(workbook, facilityWs, CONFIG.facilityLogSheetName);
+      }
+
+      // 설비명 표준화 시트(제조)는 읽기 전용 — 원본 그대로 복원
+      try {
+        const origAccessToken2 = await getValidAccessToken();
+        const origResponse = await axios.get(
+          `https://graph.microsoft.com/v1.0/me/drive/root:/${CONFIG.excelFileName}:/content`,
+          { headers: { 'Authorization': `Bearer ${origAccessToken2}` }, responseType: 'arraybuffer' }
+        );
+        const origWb = XLSX.read(Buffer.from(origResponse.data), { type: 'buffer' });
+        if (origWb.Sheets[CONFIG.equipmentStandardSheet]) {
+          workbook.Sheets[CONFIG.equipmentStandardSheet] = origWb.Sheets[CONFIG.equipmentStandardSheet];
+          if (!workbook.SheetNames.includes(CONFIG.equipmentStandardSheet)) {
+            workbook.SheetNames.push(CONFIG.equipmentStandardSheet);
+          }
+        }
+      } catch (e) {
+        console.warn('⚠️ 설비 표준화 시트 복원 스킵:', e.message);
+      }
 
       const excelBuffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
 
@@ -541,6 +722,7 @@ app.post('/api/inventory/update', async (req, res) => {
     if (success) {
       try {
         addLog(action || '수정', item, 현재수량 - oldQuantity, user || 'Manual');
+        addFacilityLog(action || '수정', item, 현재수량 - oldQuantity, user || 'Manual');
       } catch (logErr) {
         console.error('로그 기록 중 오류(무시됨):', logErr.message);
       }
@@ -574,6 +756,7 @@ app.post('/api/inventory/manual-update', async (req, res) => {
     if (success) {
       try {
         addLog(action || '수정', item, 현재수량 - oldQuantity, user || 'Manual');
+        addFacilityLog(action || '수정', item, 현재수량 - oldQuantity, user || 'Manual');
       } catch (logErr) {
         console.error('📝 로그 기록 오류(무시됨):', logErr.message);
       }
@@ -619,6 +802,49 @@ app.get('/api/inventory/logs', (req, res) => {
     const logs = loadLogs();
     const limit = parseInt(req.query.limit) || 100;
     res.json({ success: true, data: logs.slice(0, limit) });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// 설비이력 전체 조회 (설비명 필터 가능)
+app.get('/api/inventory/facility-logs', (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 200;
+    const facility = req.query.facility ? String(req.query.facility) : null;
+    let logs = facilityLogs;
+    if (facility) {
+      logs = logs.filter(l => l.표준설비명 === facility || l.원본설비명 === facility);
+    }
+    res.json({ success: true, data: logs.slice(0, limit), total: logs.length });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// 설비별 출고 요약 (대시보드용)
+app.get('/api/inventory/facility-summary', async (req, res) => {
+  try {
+    // 설비별 총 출고 건수/수량 집계
+    const summary = {};
+    facilityLogs.forEach(log => {
+      const facility = log.표준설비명 || log.원본설비명 || '미분류';
+      if (!summary[facility]) {
+        summary[facility] = { 표준설비명: facility, 출고건수: 0, 출고수량: 0, 입고건수: 0, 입고수량: 0, 최근이력: null };
+      }
+      const qty = Math.abs(Number(log.변경수량) || 0);
+      if (log.action === '출고' || (log.변경수량 < 0)) {
+        summary[facility].출고건수 += 1;
+        summary[facility].출고수량 += qty;
+      } else {
+        summary[facility].입고건수 += 1;
+        summary[facility].입고수량 += qty;
+      }
+      if (!summary[facility].최근이력) {
+        summary[facility].최근이력 = log.timestampKR;
+      }
+    });
+    res.json({ success: true, data: Object.values(summary) });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -701,6 +927,7 @@ app.post('/api/ai/chat', async (req, res) => {
             targetItem.최종수정시각 = getKSTDate();
             targetItem.작업자 = user || 'AI 어시스턴트';
             addLog(action, targetItem, finalChange, user || 'AI 어시스턴트');
+            addFacilityLog(action, targetItem, finalChange, user || 'AI 어시스턴트');
           }
         }
 
