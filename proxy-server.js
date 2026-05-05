@@ -324,8 +324,12 @@ function applyCommonEquipment(allData) {
 // ============================================================
 // 설비이력 관리
 // ============================================================
-function addFacilityLog(action, item, quantityChange, user) {
+function addFacilityLog(action, item, quantityChange, user, oldQty) {
   const stdEquipment = item.표준설비명 || item.적용설비;
+  // item.현재수량은 이미 새 수량(newQty)으로 업데이트된 상태이므로,
+  // oldQty가 전달된 경우 그것을 사용하고, 없으면 역산한다
+  const newQty = item.현재수량;
+  const prevQty = (oldQty !== undefined && oldQty !== null) ? oldQty : (newQty - quantityChange);
   const entry = {
     id: uuidv4(),
     timestampKR: getKSTDate(),
@@ -336,8 +340,8 @@ function addFacilityLog(action, item, quantityChange, user) {
     부품종류: item.부품종류,
     모델명: item.모델명,
     변경수량: quantityChange,
-    변경전수량: item.현재수량 - quantityChange,
-    변경후수량: item.현재수량,
+    변경전수량: prevQty,
+    변경후수량: newQty,
     isCommonPart: item.isCommonPart || false,
     user
   };
@@ -783,7 +787,7 @@ app.post('/api/inventory/update', async (req, res) => {
     if (success) {
       try {
         addLog(action || '수정', item, 현재수량 - oldQuantity, user || 'Manual');
-        addFacilityLog(action || '수정', item, 현재수량 - oldQuantity, user || 'Manual');
+        addFacilityLog(action || '수정', item, 현재수량 - oldQuantity, user || 'Manual', oldQuantity);
       } catch (logErr) {
         console.error('로그 기록 중 오류(무시됨):', logErr.message);
       }
@@ -817,7 +821,7 @@ app.post('/api/inventory/manual-update', async (req, res) => {
     if (success) {
       try {
         addLog(action || '수정', item, 현재수량 - oldQuantity, user || 'Manual');
-        addFacilityLog(action || '수정', item, 현재수량 - oldQuantity, user || 'Manual');
+        addFacilityLog(action || '수정', item, 현재수량 - oldQuantity, user || 'Manual', oldQuantity);
       } catch (logErr) {
         console.error('📝 로그 기록 오류(무시됨):', logErr.message);
       }
@@ -894,9 +898,10 @@ app.get('/api/inventory/facility-logs', (req, res) => {
       logs = logs.filter(l => {
         // 일반 설비: 표준설비명 또는 원본설비명 매칭
         if (l.표준설비명 === facility || l.원본설비명 === facility) return true;
-        // 공통부품 출고 이력: 원본시트가 '공통'이고 실제사용설비(표준설비명에 저장)가 매칭
-        if (isCommon && l.isCommonPart && l.표준설비명 === facility) return true;
-        // 어떤 설비든 공통부품 이력을 원본시트 기반으로 조회 (공통탭 대시보드용)
+        // 공통부품 출고 이력: 실제 사용 설비(표준설비명에 저장됨)가 해당 설비와 일치하면 표시
+        // isCommon 여부와 관계없이 — 일반 설비 대시보드에서도 공통부품 사용 이력 보여야 함
+        if (l.isCommonPart && l.표준설비명 === facility) return true;
+        // 공통 탭 대시보드용: 원본시트가 '공통'인 이력 전체
         if (isCommon && l.원본시트 === '공통') return true;
         return false;
       });
@@ -982,12 +987,14 @@ app.post('/api/inventory/common-update', async (req, res) => {
     item.최종수정시각 = getKSTDate();
     item.작업자 = user || 'Manual';
 
+    // ✅ 수정: 로그를 먼저 메모리에 추가한 뒤 엑셀 저장 → 이력이 설비이력 시트에 함께 기록됨
+    const quantityChange = 현재수량 - oldQuantity;
+    const logItem = { ...item, 적용설비: 실제사용설비, 표준설비명: 실제사용설비, isCommonPart: true };
+    addLog(action || '출고', logItem, quantityChange, user || 'Manual');
+    addFacilityLog(action || '출고', logItem, quantityChange, user || 'Manual', oldQuantity);
+
     const success = await updateExcelOnOneDrive(data);
     if (success) {
-      // 로그에는 실제 설비명 기록
-      const logItem = { ...item, 적용설비: 실제사용설비, 표준설비명: 실제사용설비, isCommonPart: true };
-      addLog(action || '출고', logItem, 현재수량 - oldQuantity, user || 'Manual');
-      addFacilityLog(action || '출고', logItem, 현재수량 - oldQuantity, user || 'Manual');
       checkAndNotifyLowStock(data);
       console.log(`🏭 공통부품 출고 기록 — ${item.모델명} → 실제설비: ${실제사용설비}`);
       return res.status(200).json({ success: true, message: '공통부품 출고 완료', data: item });
@@ -1089,6 +1096,7 @@ ${commonItemsList}
           if (targetItem) {
             const changeQty = Number(item.수량) || 0;
             const finalChange = action === '출고' ? -changeQty : changeQty;
+            const oldQty = targetItem.현재수량; // ✅ 변경 전 수량 저장
             targetItem.현재수량 = action === '출고' ? Math.max(0, targetItem.현재수량 - changeQty) : targetItem.현재수량 + changeQty;
             targetItem.최종수정시각 = getKSTDate();
             targetItem.작업자 = user || 'AI 어시스턴트';
@@ -1103,7 +1111,7 @@ ${commonItemsList}
             }
 
             addLog(action, logItem, finalChange, user || 'AI 어시스턴트');
-            addFacilityLog(action, logItem, finalChange, user || 'AI 어시스턴트');
+            addFacilityLog(action, logItem, finalChange, user || 'AI 어시스턴트', oldQty);
           }
         }
 
