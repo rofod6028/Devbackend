@@ -575,7 +575,7 @@ async function sendTeamsAlert(lowStockItems) {
   const headerRow = {
     type: 'TableRow',
     style: 'accent',
-    cells: ['시트', '부품종류', '모델명', '현재수량', '최소수량', '부족수량'].map(h => ({
+    cells: ['시트', '적용설비', '부품종류', '모델명', '현재수량', '최소수량', '부족수량'].map(h => ({
       type: 'TableCell',
       items: [{ type: 'TextBlock', text: h, weight: 'Bolder', wrap: true }]
     }))
@@ -585,6 +585,7 @@ async function sendTeamsAlert(lowStockItems) {
     type: 'TableRow',
     cells: [
       { type: 'TableCell', items: [{ type: 'TextBlock', text: item.원본시트 || '-', wrap: true }] },
+      { type: 'TableCell', items: [{ type: 'TextBlock', text: (item.표준설비명 || item.적용설비 || '-'), wrap: true }] },
       { type: 'TableCell', items: [{ type: 'TextBlock', text: item.부품종류 || '-', wrap: true }] },
       { type: 'TableCell', items: [{ type: 'TextBlock', text: item.모델명 || '-', wrap: true }] },
       { type: 'TableCell', items: [{ type: 'TextBlock', text: String(item.현재수량), color: item.현재수량 === 0 ? 'Attention' : 'Warning', weight: 'Bolder', wrap: true }] },
@@ -613,7 +614,7 @@ async function sendTeamsAlert(lowStockItems) {
             type: 'Table',
             gridStyle: 'accent',
             firstRowAsHeader: true,
-            columns: [{ width: 1 }, { width: 2 }, { width: 3 }, { width: 1 }, { width: 1 }, { width: 1 }],
+            columns: [{ width: 1 }, { width: 2 }, { width: 2 }, { width: 3 }, { width: 1 }, { width: 1 }, { width: 1 }],
             rows: [headerRow, ...dataRows]
           },
           { type: 'TextBlock', text: '※ 최소보유수량이 0으로 설정된 항목은 알림에서 제외됩니다.', size: 'Small', isSubtle: true, wrap: true, spacing: 'Medium' }
