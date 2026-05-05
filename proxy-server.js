@@ -217,68 +217,14 @@ let cachedData = null;
 let lastFetchTime = null;
 const CACHE_DURATION = 60 * 1000;
 
-// 설비명 표준화 테이블 캐시
-let equipmentStandardMap = null;   // { '원본설비명': '표준설비명' }
-let lastEquipmentFetchTime = null;
-const EQUIPMENT_CACHE_DURATION = 5 * 60 * 1000; // 5분
 
-// 설비이력 메모리 버퍼
-let facilityLogs = [];
-
-function invalidateCache() {
-  cachedData = null;
-  lastFetchTime = null;
-}
-
-// ============================================================
-// 설비명 표준화 (제조 시트 기반)
-// ============================================================
-// 제조 시트 컬럼 구조:
-//   원본설비명 | 표준설비명
-//
-// 공통부품 자동 판별 규칙:
-//   설비명 베이스(#숫자 제거)가 같고, 동일 모델명이 2개 이상 설비에 존재하면
-//   → 표준설비명이 "(공통)"으로 끝나도록 백엔드에서 override
-//
-async function loadEquipmentStandards(workbook) {
-  const now = Date.now();
-  if (equipmentStandardMap && lastEquipmentFetchTime && (now - lastEquipmentFetchTime) < EQUIPMENT_CACHE_DURATION) {
-    return equipmentStandardMap;
-  }
-
-  const sheet = workbook.Sheets[CONFIG.equipmentStandardSheet];
-  equipmentStandardMap = {};
-
-  if (sheet) {
-    const rows = XLSX.utils.sheet_to_json(sheet);
-    // _x000D_ 정제 함수 (로드 시점에 사용)
-    const cleanCell = (v) => String(v || '').replace(/_x000D_/g, '').replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
-    rows.forEach(row => {
-      const original = cleanCell(row['원본설비명']);
-      const standard = cleanCell(row['표준설비명']);
-      if (original && standard) {
-        equipmentStandardMap[original] = standard;
-      }
-    });
-    console.log(`🏭 설비 표준화 테이블 로드: ${Object.keys(equipmentStandardMap).length}개 매핑`);
-  } else {
-    console.warn(`⚠️ "${CONFIG.equipmentStandardSheet}" 시트 없음 — 설비명 표준화 건너뜀`);
-  }
-
-  lastEquipmentFetchTime = now;
-  return equipmentStandardMap;
-}
-
-// 원본설비명 → 표준설비명 변환
-function normalizeEquipment(originalName) {
-  // _x000D_ (엑셀 XML 캐리지리턴 인코딩) 제거 + 줄바꿈 + 공백 정리
-  originalName = String(originalName || '')
-    .replace(/_x000D_/g, '')      // 엑셀 CR 인코딩 제거
-    .replace(/[\r\n]+/g, ' ')    // 실제 줄바꿈 제거
-    .replace(/\s+/g, ' ')         // 연속 공백 → 단일 공백
+// 엑셀 셀값 정제 — _x000D_(CR인코딩) 및 줄바꿈 제거
+function cleanCellValue(v) {
+  return String(v || '')
+    .replace(/_x000D_/g, '')   // 엑셀 XML CR 인코딩 제거
+    .replace(/[\r\n]+/g, ' ') // 실제 줄바꿈 제거
+    .replace(/\s+/g, ' ')      // 연속 공백 → 단일 공백
     .trim();
-  if (!equipmentStandardMap) return originalName;
-  return equipmentStandardMap[originalName] || originalName;
 }
 
 // 설비명 베이스 추출: "제트프레스 #1 (1공장)" → "제트프레스"
@@ -391,9 +337,6 @@ async function fetchExcelFromOneDrive() {
     const workbook = XLSX.read(Buffer.from(response.data), { type: 'buffer' });
     let allMappedData = [];
 
-    // 설비명 표준화 테이블 먼저 로드 (제조 시트)
-    await loadEquipmentStandards(workbook);
-
     // 재고 시트 순회 (충전, 타정, 공통)
     CONFIG.inventorySheets.forEach(sheetName => {
       const worksheet = workbook.Sheets[sheetName];
@@ -409,16 +352,14 @@ async function fetchExcelFromOneDrive() {
         const rowKeys = Object.keys(row);
         const foundKey = rowKeys.find(key => key.trim() === '보관장소');
 
-        // _x000D_ (엑셀 XML CR 인코딩) 정제 함수
-        const clean = (v) => String(v || '').replace(/_x000D_/g, '').replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
         return {
           id: `${sheetName}_${index + 1}`,
           원본시트: sheetName,
-          대분류: clean(row['대분류']) || '미분류',
-          부품종류: clean(row['부품종류']),
-          모델명: clean(row['모델명']),
-          적용설비: clean(row['적용설비']),
-          표준설비명: normalizeEquipment(clean(row['적용설비'])),
+          대분류: cleanCellValue(row['대분류']) || '미분류',
+          부품종류: cleanCellValue(row['부품종류']),
+          모델명: cleanCellValue(row['모델명']),
+          적용설비: cleanCellValue(row['적용설비']),
+          표준설비명: cleanCellValue(row['적용설비']),
           현재수량: Number(row['현재수량']) || 0,
           최소보유수량: Number(row['최소보유수량']) || 0,
           최종수정시각: row['최종수정시각'] || '',
@@ -510,23 +451,7 @@ async function updateExcelOnOneDrive(data, retries = 3) {
         XLSX.utils.book_append_sheet(workbook, facilityWs, CONFIG.facilityLogSheetName);
       }
 
-      // 설비명 표준화 시트(제조)는 읽기 전용 — 원본 그대로 복원
-      try {
-        const origAccessToken2 = await getValidAccessToken();
-        const origResponse = await axios.get(
-          `https://graph.microsoft.com/v1.0/me/drive/root:/${CONFIG.excelFileName}:/content`,
-          { headers: { 'Authorization': `Bearer ${origAccessToken2}` }, responseType: 'arraybuffer' }
-        );
-        const origWb = XLSX.read(Buffer.from(origResponse.data), { type: 'buffer' });
-        if (origWb.Sheets[CONFIG.equipmentStandardSheet]) {
-          workbook.Sheets[CONFIG.equipmentStandardSheet] = origWb.Sheets[CONFIG.equipmentStandardSheet];
-          if (!workbook.SheetNames.includes(CONFIG.equipmentStandardSheet)) {
-            workbook.SheetNames.push(CONFIG.equipmentStandardSheet);
-          }
-        }
-      } catch (e) {
-        console.warn('⚠️ 설비 표준화 시트 복원 스킵:', e.message);
-      }
+      // 제조 시트(설비명 표준화)는 더 이상 사용하지 않음 — 엑셀 원본에서 직접 정제
 
       const excelBuffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
 
