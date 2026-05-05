@@ -776,7 +776,20 @@ app.post('/api/inventory/update', async (req, res) => {
   try {
     const { id, 현재수량, action, user } = req.body;
     const data = await fetchExcelFromOneDrive();
-    const item = data.find(d => d.id == id);
+    // id는 행 인덱스 기반이라 캐시 무효화 후 재로드 시 달라질 수 있음
+    // fallback: 모델명+원본시트+적용설비 조합으로 검색
+    let item = data.find(d => d.id == id);
+    if (!item) {
+      const { 모델명: reqModel, 원본시트: reqSheet, 적용설비: reqEquip } = req.body;
+      if (reqModel && reqSheet) {
+        item = data.find(d =>
+          String(d.모델명 || '').trim() === String(reqModel || '').trim() &&
+          d.원본시트 === reqSheet &&
+          (!reqEquip || String(d.적용설비 || '').trim() === String(reqEquip || '').trim())
+        );
+        if (item) console.log('⚠️ id 매칭 실패 → 모델명+시트+설비 fallback으로 항목 찾음:', item.모델명);
+      }
+    }
     if (!item) return res.status(404).json({ success: false, message: '항목을 찾을 수 없습니다.' });
 
     const oldQuantity = item.현재수량;
@@ -805,7 +818,20 @@ app.post('/api/inventory/manual-update', async (req, res) => {
   try {
     const { id, 현재수량, action, user } = req.body;
     const data = await fetchExcelFromOneDrive();
-    const item = data.find(d => d.id == id);
+    // id는 행 인덱스 기반이라 캐시 무효화 후 재로드 시 달라질 수 있음
+    // fallback: 모델명+원본시트+적용설비 조합으로 검색
+    let item = data.find(d => d.id == id);
+    if (!item) {
+      const { 모델명: reqModel, 원본시트: reqSheet, 적용설비: reqEquip } = req.body;
+      if (reqModel && reqSheet) {
+        item = data.find(d =>
+          String(d.모델명 || '').trim() === String(reqModel || '').trim() &&
+          d.원본시트 === reqSheet &&
+          (!reqEquip || String(d.적용설비 || '').trim() === String(reqEquip || '').trim())
+        );
+        if (item) console.log('⚠️ id 매칭 실패 → 모델명+시트+설비 fallback으로 항목 찾음:', item.모델명);
+      }
+    }
 
     if (!item) {
       console.error(`❌ 항목 찾기 실패: 요청된 ID=${id}, 데이터 첫항목 ID=${data[0]?.id}`);
