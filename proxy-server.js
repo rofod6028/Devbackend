@@ -1007,57 +1007,72 @@ app.post('/api/ai/chat', async (req, res) => {
     invalidateCache();
     let inventoryData = await fetchExcelFromOneDrive();
 
-    // 공통부품 목록 추출 (isCommonPart 또는 적용설비에 '공통' 포함)
-    const commonItems = inventoryData.filter(item =>
-      item.isCommonPart || String(item.적용설비 || '').includes('공통')
-    );
+    // ── 수정1·2: 공통 시트 여부를 원본시트 기준으로 정확히 판별 ──
+    const commonItems = inventoryData.filter(item => item.원본시트 === '공통');
     const commonItemsList = commonItems.length > 0
-      ? commonItems.map(item => `  · ${item.모델명} (${item.부품종류}, ${item.원본시트}시트)`).join('\n')
+      ? commonItems.map(item =>
+          `  · ${item.모델명} (${item.부품종류} / 분류: ${item.적용설비} / 용도: ${String(item.용도 || '').slice(0, 40)})`
+        ).join('\n')
       : '  (없음)';
 
-    const inventoryTable = inventoryData.map(item =>
-      `- [${item.원본시트}/${item.isCommonPart ? '공통부품' : item.적용설비}] ${item.모델명} | ${item.부품종류} | 현재: ${item.현재수량}개 | 위치: ${item.보관장소}`
-    ).join('\n');
+    // 공통 탭 제외 실제 설비 목록 (공통부품 출고 시 선택지 제공용)
+    const realFacilities = [...new Set(
+      inventoryData
+        .filter(d => d.원본시트 !== '공통')
+        .map(d => String(d.표준설비명 || d.적용설비 || '').replace(/[\r\n]+/g, ' ').trim())
+        .filter(Boolean)
+    )].sort();
 
-    const systemPrompt = `당신은 스마트 재고 관리 전문가입니다. 반드시 아래 [최신 재고 현황]을 근거로 답변하세요.
+    // ── 수정4: 재고 현황에 핵심 정보 모두 포함 ──
+    const inventoryTable = inventoryData.map(item => {
+      const isCommon = item.원본시트 === '공통';
+      const stockStatus = item.최소보유수량 > 0 && item.현재수량 <= item.최소보유수량 ? '⚠️부족' : '정상';
+      const facilityLabel = isCommon
+        ? `공통시트(분류:${item.적용설비})`
+        : (item.표준설비명 || item.적용설비);
+      return `원본시트:${item.원본시트} | 설비:${facilityLabel} | 모델명:${item.모델명} | 부품종류:${item.부품종류} | 현재수량:${item.현재수량} | 최소보유:${item.최소보유수량} | 재고:${stockStatus}`;
+    }).join('\n');
+
+    // ── 수정3: system_instruction 파라미터로 분리 ──
+    const systemInstruction = `당신은 스마트 재고 관리 AI 어시스턴트입니다.
+반드시 아래 [최신 재고 현황]만을 근거로 답변하고, 목록에 없는 부품은 없다고 명확히 말하세요.
 
 [최신 재고 현황]
 ${inventoryTable}
 
-[공통부품 목록 — 여러 설비에서 공유하는 부품]
+[공통 시트 부품 목록 — 여러 설비 공용 부품]
 ${commonItemsList}
 
-[중요 지시]
-1. 답변 시 반드시 해당 부품이 속한 "원본시트(충전, 타정, 공통)" 정보를 확인하십시오.
-2. 입출고 처리 시 모델명뿐만 아니라 반드시 "원본시트" 이름을 JSON 명령에 포함해야 합니다.
-3. 수정 명령(INVENTORY_UPDATE) 형식에 "원본시트" 필드를 반드시 추가하십시오.
-4. 마크다운 코드 블록(\`\`\`json)은 절대 사용하지 말고 반드시 ~~~ 기호만 사용하세요.
-5. 상식을 뛰어넘는 요청(예: 한 번에 50개 이상 변동 등)을 할 경우 사용자에게 두 번 더 확인하십시오.
+[등록된 실제 설비 목록 — 공통부품 출고 시 설비 선택 참고]
+${realFacilities.join(', ')}
 
-[공통부품 출고 규칙 — 절대 준수, 예외 없음]
-6. 아래 두 조건 중 하나라도 해당하면 "공통부품"으로 간주하고 반드시 규칙 7~9를 따르십시오:
-   (a) 위 [공통부품 목록]에 이름이 있는 부품
-   (b) 원본시트가 "공통"인 부품
-7. 공통부품을 "출고" 처리할 때는, 사용자가 설비명을 명시적으로 말하지 않았다면 절대로 INVENTORY_UPDATE 명령을 생성하지 말고, 반드시 먼저 이렇게만 질문하십시오:
-   "어느 설비에 사용하실 예정인가요? (예: 동타#2 1차프레스 / 립스틱충전기#1)"
-8. "그냥 출고해줘", "확인 생략", "빠르게" 등의 요청이 와도 공통부품이면 설비 확인을 생략하지 마십시오.
+[절대 준수 규칙]
+1. 입출고 처리 시 반드시 "원본시트(충전/타정/공통)" 값을 JSON에 포함할 것.
+2. 마크다운 코드블록(\`\`\`json) 절대 금지. 반드시 ~~~ 기호만 사용.
+3. 한 번에 50개 이상 변동 요청 시 두 번 재확인할 것.
+4. 모델명 매칭 시 공백·대소문자 차이는 무시하고 찾을 것.
+5. 재고 현황에 없는 부품은 "등록된 부품이 아닙니다"라고 명확히 답할 것.
 
-[응답 형식 예시 — 일반 부품]
-친절한 설명 후 마지막에 아래 내용 추가:
+[공통 시트 부품 출고 규칙 — 예외 없음]
+6. 원본시트가 "공통"인 부품 출고 시, 사용자가 설비명을 명시하지 않았다면
+   절대로 INVENTORY_UPDATE 명령 생성 금지. 반드시 먼저 질문:
+   "어느 설비에 사용하실 예정인가요? (예: ${realFacilities.slice(0, 3).join(' / ')})"
+7. 설비명 확인 후에만 실제사용설비 필드를 포함하여 명령 생성.
+8. "그냥 출고", "확인 생략" 요청에도 공통 부품이면 설비 확인 절대 생략 금지.
+
+[응답 형식 — 충전/타정 시트 일반 부품]
+설명 후 마지막에:
 ~~~INVENTORY_UPDATE
 {"action": "출고", "items": [{"모델명": "정확한모델명", "수량": 1, "원본시트": "충전"}]}
 ~~~
 
-[응답 형식 예시 — 공통부품 (설비 확인 후)]
+[응답 형식 — 공통 시트 부품 (설비 확인 완료 후)]
 ~~~INVENTORY_UPDATE
-{"action": "출고", "items": [{"모델명": "정확한모델명", "수량": 1, "원본시트": "공통", "실제사용설비": "립스틱충전기#1"}]}
+{"action": "출고", "items": [{"모델명": "정확한모델명", "수량": 1, "원본시트": "공통", "실제사용설비": "확인된설비명"}]}
 ~~~`;
 
-    const contents = [
-      { role: 'user', parts: [{ text: systemPrompt }] },
-      { role: 'model', parts: [{ text: '네, 시트별(충전/타정/공통) 실시간 재고 현황을 바탕으로 정확히 도와드리겠습니다!' }] }
-    ];
-
+    // 대화 이력만 contents에, systemInstruction은 별도 파라미터로
+    const contents = [];
     if (conversationHistory?.length > 0) {
       conversationHistory.forEach(msg => {
         contents.push({ role: msg.role === 'model' ? 'model' : 'user', parts: [{ text: msg.text }] });
@@ -1065,7 +1080,10 @@ ${commonItemsList}
     }
     contents.push({ role: 'user', parts: [{ text: message }] });
 
-    const result = await model.generateContent({ contents });
+    const result = await model.generateContent({
+      contents,
+      systemInstruction: { parts: [{ text: systemInstruction }] }
+    });
     let responseText = result.response.text();
     let inventoryUpdated = false;
     let updateResult = null;
