@@ -251,9 +251,11 @@ async function loadEquipmentStandards(workbook) {
 
   if (sheet) {
     const rows = XLSX.utils.sheet_to_json(sheet);
+    // _x000D_ 정제 함수 (로드 시점에 사용)
+    const cleanCell = (v) => String(v || '').replace(/_x000D_/g, '').replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
     rows.forEach(row => {
-      const original = String(row['원본설비명'] || '').trim();
-      const standard = String(row['표준설비명'] || '').trim();
+      const original = cleanCell(row['원본설비명']);
+      const standard = cleanCell(row['표준설비명']);
       if (original && standard) {
         equipmentStandardMap[original] = standard;
       }
@@ -269,8 +271,12 @@ async function loadEquipmentStandards(workbook) {
 
 // 원본설비명 → 표준설비명 변환
 function normalizeEquipment(originalName) {
-  // 엑셀 셀 내 줄바꿈(Alt+Enter) 제거 후 공백 정리
-  originalName = String(originalName || '').replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
+  // _x000D_ (엑셀 XML 캐리지리턴 인코딩) 제거 + 줄바꿈 + 공백 정리
+  originalName = String(originalName || '')
+    .replace(/_x000D_/g, '')      // 엑셀 CR 인코딩 제거
+    .replace(/[\r\n]+/g, ' ')    // 실제 줄바꿈 제거
+    .replace(/\s+/g, ' ')         // 연속 공백 → 단일 공백
+    .trim();
   if (!equipmentStandardMap) return originalName;
   return equipmentStandardMap[originalName] || originalName;
 }
@@ -403,14 +409,16 @@ async function fetchExcelFromOneDrive() {
         const rowKeys = Object.keys(row);
         const foundKey = rowKeys.find(key => key.trim() === '보관장소');
 
+        // _x000D_ (엑셀 XML CR 인코딩) 정제 함수
+        const clean = (v) => String(v || '').replace(/_x000D_/g, '').replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
         return {
           id: `${sheetName}_${index + 1}`,
           원본시트: sheetName,
-          대분류: row['대분류'] || '미분류',
-          부품종류: row['부품종류'] || '',
-          모델명: row['모델명'] || '',
-          적용설비: row['적용설비'] || '',
-          표준설비명: normalizeEquipment(String(row['적용설비'] || '').replace(/[\r\n]+/g, ' ').trim()),
+          대분류: clean(row['대분류']) || '미분류',
+          부품종류: clean(row['부품종류']),
+          모델명: clean(row['모델명']),
+          적용설비: clean(row['적용설비']),
+          표준설비명: normalizeEquipment(clean(row['적용설비'])),
           현재수량: Number(row['현재수량']) || 0,
           최소보유수량: Number(row['최소보유수량']) || 0,
           최종수정시각: row['최종수정시각'] || '',
