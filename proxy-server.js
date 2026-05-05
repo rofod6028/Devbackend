@@ -426,12 +426,22 @@ async function fetchExcelFromOneDrive() {
       console.log(`📜 로그 시트 로드 완료: ${memoryLogs.length}건`);
     }
 
-    // 설비이력 시트 로드
+    // 설비이력 시트 로드 — 엑셀 이력과 메모리 이력을 항상 병합 (휘발 방지)
     const facilityLogWs = workbook.Sheets[CONFIG.facilityLogSheetName];
-    if (facilityLogWs && facilityLogs.length === 0) {
+    if (facilityLogWs) {
       const rows = XLSX.utils.sheet_to_json(facilityLogWs);
-      facilityLogs = rows.reverse().slice(0, 5000);
-      console.log(`🏭 설비이력 시트 로드 완료: ${facilityLogs.length}건`);
+      const excelLogs = rows.reverse(); // 최신순
+      const memoryIds = new Set(facilityLogs.map(l => l.id));
+      const newFromExcel = excelLogs.filter(l => l.id && !memoryIds.has(l.id));
+      if (newFromExcel.length > 0) {
+        facilityLogs = [...facilityLogs, ...newFromExcel];
+        facilityLogs.sort((a, b) => new Date(b.timestampKR || 0) - new Date(a.timestampKR || 0));
+        facilityLogs = facilityLogs.slice(0, 5000);
+        console.log(`🏭 설비이력 병합 완료: 총 ${facilityLogs.length}건 (엑셀에서 ${newFromExcel.length}건 추가)`);
+      } else if (facilityLogs.length === 0) {
+        facilityLogs = excelLogs.slice(0, 5000);
+        console.log(`🏭 설비이력 초기 로드: ${facilityLogs.length}건`);
+      }
     }
 
     // 공통부품 자동 판별 적용 (공통 탭 항목 제외)
@@ -829,9 +839,18 @@ app.get('/api/inventory/facility-logs', (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 200;
     const facility = req.query.facility ? String(req.query.facility) : null;
+    const isCommon = req.query.isCommon === 'true'; // 공통탭 여부
     let logs = facilityLogs;
     if (facility) {
-      logs = logs.filter(l => l.표준설비명 === facility || l.원본설비명 === facility);
+      logs = logs.filter(l => {
+        // 일반 설비: 표준설비명 또는 원본설비명 매칭
+        if (l.표준설비명 === facility || l.원본설비명 === facility) return true;
+        // 공통부품 출고 이력: 원본시트가 '공통'이고 실제사용설비(표준설비명에 저장)가 매칭
+        if (isCommon && l.isCommonPart && l.표준설비명 === facility) return true;
+        // 어떤 설비든 공통부품 이력을 원본시트 기반으로 조회 (공통탭 대시보드용)
+        if (isCommon && l.원본시트 === '공통') return true;
+        return false;
+      });
     }
     res.json({ success: true, data: logs.slice(0, limit), total: logs.length });
   } catch (error) {
