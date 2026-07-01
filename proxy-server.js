@@ -285,24 +285,15 @@ function getEquipmentBase(name) {
 }
 
 // ============================================================
-// 다중 호기 결합 설비명 파싱
-// 예: "마블충전기#3,4 (1공장)" → ["마블충전기#3 (1공장)", "마블충전기#4 (1공장)"]
-// 콤마로 묶인 #숫자 패턴이 없으면 null 반환
+// 재고그룹 키 생성 — 같은 모델명 + 원본시트를 가진 행들은 하나의 재고그룹으로 간주
+// (엑셀에서 "충전기#1 (1공장)", "충전기#2 (1공장)"처럼 호기별로 행이 나뉘어 있어도
+//  같은 부품(모델명 동일)을 공유 재고로 관리하는 경우, 이 키로 묶어서 수량을 동기화)
 // ============================================================
-function parseMultiUnitEquipment(rawName) {
-  const name = String(rawName || '').replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
-  if (!name) return null;
-  const match = name.match(/^(.*?)#\s*([\d]+(?:\s*,\s*\d+)+)\s*(.*)$/);
-  if (!match) return null;
-  const baseName = match[1].trim();
-  const unitsRaw = match[2];
-  const suffix = match[3].trim();
-  const units = unitsRaw.split(',').map(u => u.trim()).filter(Boolean);
-  if (units.length < 2) return null;
-  return units.map(u => {
-    const single = `${baseName}#${u}`;
-    return suffix ? `${single} ${suffix}` : single;
-  });
+function getInventoryGroupKey(item) {
+  const model = String(item.모델명 || '').trim().toLowerCase();
+  const sheet = String(item.원본시트 || '').trim();
+  if (!model) return null;
+  return `${sheet}::${model}`;
 }
 
 // 전체 데이터에서 공통부품 자동 판별 후 표준설비명 override
@@ -421,10 +412,8 @@ async function fetchExcelFromOneDrive() {
         const foundKey = rowKeys.find(key => key.trim() === '보관장소');
         const rawEquip = row['적용설비'] || '';
         const stdEquip = normalizeEquipment(String(rawEquip).replace(/[\r\n]+/g, ' ').trim());
-        // 다중 호기 결합 설비 파싱: "충전기#3,4 (1공장)" → ["충전기#3 (1공장)", "충전기#4 (1공장)"]
-        const multiUnitList = parseMultiUnitEquipment(stdEquip) || parseMultiUnitEquipment(rawEquip);
 
-        return {
+        const item = {
           id: `${sheetName}_${index + 1}`,
           원본시트: sheetName,
           대분류: row['대분류'] || '미분류',
@@ -432,8 +421,6 @@ async function fetchExcelFromOneDrive() {
           모델명: row['모델명'] || '',
           적용설비: row['적용설비'] || '',
           표준설비명: stdEquip,
-          설비목록: multiUnitList, // 다중 호기 결합이면 배열, 아니면 null
-          isMultiUnit: !!multiUnitList,
           현재수량: Number(row['현재수량']) || 0,
           최소보유수량: Number(row['최소보유수량']) || 0,
           최종수정시각: row['최종수정시각'] || '',
@@ -442,9 +429,30 @@ async function fetchExcelFromOneDrive() {
           보관장소: foundKey ? row[foundKey] : '위치 미지정',
           isCommonPart: false
         };
+        item.재고그룹키 = getInventoryGroupKey(item);
+        return item;
       });
       allMappedData = [...allMappedData, ...mappedData];
     });
+
+    // ── 재고그룹 동기화: 같은 모델명+원본시트를 가진 행들은 같은 재고그룹으로 묶어
+    // 그룹 내 수량이 다르면(엑셀 원본이 서로 다른 값으로 저장돼 있던 경우) 최신 수정시각 값으로 통일 ──
+    {
+      const groups = {};
+      allMappedData.forEach(item => {
+        if (!item.재고그룹키) return;
+        (groups[item.재고그룹키] = groups[item.재고그룹키] || []).push(item);
+      });
+      Object.values(groups).forEach(group => {
+        if (group.length < 2) return;
+        const quantities = new Set(group.map(g => g.현재수량));
+        if (quantities.size <= 1) return; // 이미 동일하면 skip
+        // 최종수정시각이 가장 최근인 행의 수량을 그룹 전체 기준값으로 채택
+        const latest = group.reduce((a, b) => (String(b.최종수정시각) > String(a.최종수정시각) ? b : a));
+        group.forEach(g => { g.현재수량 = latest.현재수량; });
+        console.log(`🔗 재고그룹 수량 불일치 감지 → 동기화: ${group[0].모델명} (${group[0].원본시트}) → ${latest.현재수량}개`);
+      });
+    }
 
     // 로그 시트 로드 (사용내역종합) — memoryLogs가 이미 있으면 덮어쓰지 않음
     const logWorksheet = workbook.Sheets[CONFIG.logSheetName];
@@ -806,6 +814,19 @@ app.post('/api/inventory/update', async (req, res) => {
     item.현재수량 = 현재수량;
     item.최종수정시각 = getKSTDate();
 
+    // ── 재고그룹 동기화: 같은 모델명+원본시트를 가진 다른 행(다른 호기)도 함께 수량 반영 ──
+    const groupKey = item.재고그룹키 || getInventoryGroupKey(item);
+    if (groupKey) {
+      data.forEach(other => {
+        if (other.id === item.id) return;
+        const otherKey = other.재고그룹키 || getInventoryGroupKey(other);
+        if (otherKey === groupKey) {
+          other.현재수량 = 현재수량;
+          other.최종수정시각 = item.최종수정시각;
+        }
+      });
+    }
+
     const success = await updateExcelOnOneDrive(data);
     if (success) {
       try {
@@ -826,7 +847,7 @@ app.post('/api/inventory/update', async (req, res) => {
 
 app.post('/api/inventory/manual-update', async (req, res) => {
   try {
-    const { id, 현재수량, action, user, 실제사용설비 } = req.body;
+    const { id, 현재수량, action, user } = req.body;
     const data = await fetchExcelFromOneDrive();
     const item = data.find(d => d.id == id);
 
@@ -835,35 +856,42 @@ app.post('/api/inventory/manual-update', async (req, res) => {
       return res.status(404).json({ success: false, message: '항목을 찾을 수 없습니다.' });
     }
 
-    // 다중 호기 결합 부품 출고(수량 감소)인데 실제사용설비(호기)가 없으면 차단
-    // (FacilityPage에서 이미 특정 호기가 정해진 경우엔 실제사용설비가 자동으로 함께 전달됨)
-    const isOutgoingQty = Number(현재수량) < Number(item.현재수량);
-    if (item.isMultiUnit && isOutgoingQty && !실제사용설비) {
-      return res.status(400).json({ success: false, message: '다중 호기 결합 부품 출고 시 실제사용설비(호기)는 필수입니다.', needsUnitSelection: true });
-    }
-    if (item.isMultiUnit && 실제사용설비 && Array.isArray(item.설비목록) && !item.설비목록.includes(실제사용설비)) {
-      return res.status(400).json({ success: false, message: `선택하신 설비(${실제사용설비})는 이 부품의 호기 목록에 없습니다.` });
-    }
-
     const oldQuantity = item.현재수량;
+    const qtyDelta = Number(현재수량) - Number(oldQuantity);
     item.현재수량 = 현재수량;
     item.최종수정시각 = getKSTDate();
     item.작업자 = user || 'Manual';
 
+    // ── 재고그룹 동기화: 같은 모델명+원본시트를 가진 다른 행(다른 호기)도 함께 수량 반영 ──
+    // 예: "충전기#1 (1공장)"과 "충전기#2 (1공장)"가 같은 모델명이면 재고 공유이므로 동시에 갱신
+    const groupKey = item.재고그룹키 || getInventoryGroupKey(item);
+    let syncedCount = 0;
+    if (groupKey) {
+      data.forEach(other => {
+        if (other.id === item.id) return;
+        const otherKey = other.재고그룹키 || getInventoryGroupKey(other);
+        if (otherKey === groupKey) {
+          other.현재수량 = 현재수량;
+          other.최종수정시각 = item.최종수정시각;
+          other.작업자 = item.작업자;
+          syncedCount++;
+        }
+      });
+      if (syncedCount > 0) {
+        console.log(`🔗 재고그룹 동기화: ${item.모델명} (${item.원본시트}) → 같은 그룹 ${syncedCount}개 행에 수량 ${현재수량} 반영`);
+      }
+    }
+
     const success = await updateExcelOnOneDrive(data);
     if (success) {
       try {
-        // 다중호기 결합 부품이고 실제사용설비(개별호기)가 지정된 경우, 이력에는 개별호기명으로 기록
-        const logItem = (item.isMultiUnit && 실제사용설비)
-          ? { ...item, 표준설비명: 실제사용설비 }
-          : item;
-        addLog(action || '수정', logItem, 현재수량 - oldQuantity, user || 'Manual');
-        addFacilityLog(action || '수정', logItem, 현재수량 - oldQuantity, user || 'Manual');
+        addLog(action || '수정', item, qtyDelta, user || 'Manual');
+        addFacilityLog(action || '수정', item, qtyDelta, user || 'Manual');
       } catch (logErr) {
         console.error('📝 로그 기록 오류(무시됨):', logErr.message);
       }
       checkAndNotifyLowStock(data); // Teams 저재고 알림
-      return res.status(200).json({ success: true, message: '업데이트 완료', data: item });
+      return res.status(200).json({ success: true, message: '업데이트 완료', data: item, syncedGroupCount: syncedCount });
     } else {
       return res.status(500).json({ success: false, message: 'OneDrive 업데이트 실패' });
     }
@@ -1023,6 +1051,20 @@ app.post('/api/inventory/common-update', async (req, res) => {
     item.최종수정시각 = getKSTDate();
     item.작업자 = user || 'Manual';
 
+    // ── 재고그룹 동기화: 같은 모델명+원본시트를 가진 다른 행도 함께 수량 반영 ──
+    const groupKey = item.재고그룹키 || getInventoryGroupKey(item);
+    if (groupKey) {
+      data.forEach(other => {
+        if (other.id === item.id) return;
+        const otherKey = other.재고그룹키 || getInventoryGroupKey(other);
+        if (otherKey === groupKey) {
+          other.현재수량 = 현재수량;
+          other.최종수정시각 = item.최종수정시각;
+          other.작업자 = item.작업자;
+        }
+      });
+    }
+
     const success = await updateExcelOnOneDrive(data);
     if (success) {
       // 로그에는 실제 설비명 기록
@@ -1037,54 +1079,6 @@ app.post('/api/inventory/common-update', async (req, res) => {
     }
   } catch (error) {
     console.error('❌ common-update 에러:', error.message);
-    return res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-// ============================================================
-// 다중 호기 결합 부품 출고 — 실제 사용 호기 포함 처리
-// 예: 원본행 "충전기#1,2,3,4 (1공장)"인 부품을 출고할 때
-// 실제사용설비로 "충전기#2 (1공장)"처럼 개별 호기를 지정받아
-// 설비이력에는 개별 호기로 기록하되, 엑셀 원본 행/재고수량은 그대로 결합 유지
-// POST /api/inventory/multiunit-update
-// body: { id, 현재수량, action, user, 실제사용설비 }
-// ============================================================
-app.post('/api/inventory/multiunit-update', async (req, res) => {
-  try {
-    const { id, 현재수량, action, user, 실제사용설비 } = req.body;
-
-    if (!실제사용설비) {
-      return res.status(400).json({ success: false, message: '다중 호기 부품 출고 시 실제사용설비(호기)는 필수입니다.' });
-    }
-
-    const data = await fetchExcelFromOneDrive();
-    const item = data.find(d => d.id == id);
-    if (!item) return res.status(404).json({ success: false, message: '항목을 찾을 수 없습니다.' });
-
-    // 실제사용설비가 이 항목의 설비목록에 포함된 호기인지 검증
-    if (Array.isArray(item.설비목록) && item.설비목록.length > 0 && !item.설비목록.includes(실제사용설비)) {
-      return res.status(400).json({ success: false, message: `선택하신 설비(${실제사용설비})는 이 부품의 호기 목록에 없습니다.` });
-    }
-
-    const oldQuantity = item.현재수량;
-    item.현재수량 = 현재수량;
-    item.최종수정시각 = getKSTDate();
-    item.작업자 = user || 'Manual';
-
-    const success = await updateExcelOnOneDrive(data);
-    if (success) {
-      // 로그에는 실제 선택된 호기명 기록, 엑셀 원본 행(적용설비)은 결합 표기 그대로 유지
-      const logItem = { ...item, 표준설비명: 실제사용설비 };
-      addLog(action || '출고', logItem, 현재수량 - oldQuantity, user || 'Manual');
-      addFacilityLog(action || '출고', logItem, 현재수량 - oldQuantity, user || 'Manual');
-      checkAndNotifyLowStock(data);
-      console.log(`🏭 다중호기 부품 출고 기록 — ${item.모델명} → 실제호기: ${실제사용설비}`);
-      return res.status(200).json({ success: true, message: '출고 완료', data: item });
-    } else {
-      return res.status(500).json({ success: false, message: 'OneDrive 업데이트 실패' });
-    }
-  } catch (error) {
-    console.error('❌ multiunit-update 에러:', error.message);
     return res.status(500).json({ success: false, message: error.message });
   }
 });
@@ -1112,14 +1106,6 @@ app.post('/api/ai/chat', async (req, res) => {
         .filter(Boolean)
     )].sort();
 
-    // 다중 호기 결합 부품 목록 (예: "충전기#1,2,3,4 (1공장)" 형태) — 출고 시 호기 확인 필요
-    const multiUnitItems = inventoryData.filter(item => item.isMultiUnit && Array.isArray(item.설비목록));
-    const multiUnitItemsList = multiUnitItems.length > 0
-      ? multiUnitItems.map(item =>
-          `  · ${item.모델명} (원본시트:${item.원본시트} / 결합표기:${item.표준설비명 || item.적용설비} / 개별호기:[${item.설비목록.join(', ')}])`
-        ).join('\n')
-      : '  (없음)';
-
     // ── 수정4: 재고 현황에 핵심 정보 모두 포함 ──
     const inventoryTable = inventoryData.map(item => {
       const isCommon = item.원본시트 === '공통';
@@ -1143,9 +1129,6 @@ ${commonItemsList}
 [등록된 실제 설비 목록 — 공통부품 출고 시 설비 선택 참고]
 ${realFacilities.join(', ')}
 
-[다중 호기 결합 부품 목록 — 하나의 재고 행이 여러 호기(#1,2,3...)를 함께 표기]
-${multiUnitItemsList}
-
 [절대 준수 규칙]
 1. 입출고 처리 시 반드시 "원본시트(충전/타정/공통)" 값을 JSON에 포함할 것.
 2. 마크다운 코드블록(\`\`\`json) 절대 금지. 반드시 ~~~ 기호만 사용.
@@ -1160,14 +1143,6 @@ ${multiUnitItemsList}
 7. 설비명 확인 후에만 실제사용설비 필드를 포함하여 명령 생성.
 8. "그냥 출고", "확인 생략" 요청에도 공통 부품이면 설비 확인 절대 생략 금지.
 
-[다중 호기 결합 부품 출고 규칙 — 예외 없음]
-9. 위 [다중 호기 결합 부품 목록]에 있는 부품을 출고할 때, 사용자가 개별 호기를 명시하지 않았다면
-   절대로 INVENTORY_UPDATE 명령 생성 금지. 반드시 먼저 질문:
-   "어느 호기에 사용하실 예정인가요? (해당 부품의 [개별호기] 목록 중에서 선택하도록 안내)"
-10. 사용자가 답한 호기가 해당 부품의 [개별호기] 목록에 있는 정확한 표기와 일치하도록 확인 후,
-    실제사용설비 필드에 그 개별호기 전체 문자열(예: "충전기#2 (1공장)")을 포함하여 명령 생성.
-11. "그냥 출고", "확인 생략" 요청에도 다중 호기 결합 부품이면 호기 확인 절대 생략 금지.
-
 [응답 형식 — 충전/타정 시트 일반 부품(단일 설비)]
 설명 후 마지막에:
 ~~~INVENTORY_UPDATE
@@ -1177,11 +1152,6 @@ ${multiUnitItemsList}
 [응답 형식 — 공통 시트 부품 (설비 확인 완료 후)]
 ~~~INVENTORY_UPDATE
 {"action": "출고", "items": [{"모델명": "정확한모델명", "수량": 1, "원본시트": "공통", "실제사용설비": "확인된설비명"}]}
-~~~
-
-[응답 형식 — 다중 호기 결합 부품 (호기 확인 완료 후)]
-~~~INVENTORY_UPDATE
-{"action": "출고", "items": [{"모델명": "정확한모델명", "수량": 1, "원본시트": "충전", "실제사용설비": "확인된개별호기명"}]}
 ~~~`;
 
     // 대화 이력만 contents에, systemInstruction은 별도 파라미터로
@@ -1225,45 +1195,6 @@ ${multiUnitItemsList}
             console.log(`🚫 공통부품 설비 미확인 차단: ${modelNames}`);
             return res.json({ success: true, message: clarifyMsg, inventoryUpdated: false, updateResult: null, timestamp: new Date().toISOString() });
           }
-
-          // ── 백엔드 안전망: 다중 호기 결합 부품 출고인데 실제사용설비(개별호기) 없으면 강제 차단 ──
-          const missingUnitItems = items.filter(item => {
-            const matched = inventoryData.find(d =>
-              String(d.모델명 || '').replace(/\s+/g, '').toLowerCase() === String(item.모델명 || '').replace(/\s+/g, '').toLowerCase() &&
-              d.원본시트 === item.원본시트
-            );
-            if (!matched || !matched.isMultiUnit) return false; // 다중호기 부품만 체크
-            return !item.실제사용설비 || !item.실제사용설비.trim();
-          });
-
-          if (missingUnitItems.length > 0) {
-            const modelNames = missingUnitItems.map(i => i.모델명).join(', ');
-            const matchedItem = inventoryData.find(d =>
-              String(d.모델명 || '').replace(/\s+/g, '').toLowerCase() === String(missingUnitItems[0].모델명 || '').replace(/\s+/g, '').toLowerCase() &&
-              d.원본시트 === missingUnitItems[0].원본시트
-            );
-            const unitExamples = matchedItem?.설비목록?.join(' / ') || '';
-            const clarifyMsg = `⚠️ **${modelNames}**은(는) 여러 호기가 결합된 부품입니다.\n어느 호기에 사용하실 예정인가요?\n(${unitExamples})`;
-            console.log(`🚫 다중호기 부품 호기 미확인 차단: ${modelNames}`);
-            return res.json({ success: true, message: clarifyMsg, inventoryUpdated: false, updateResult: null, timestamp: new Date().toISOString() });
-          }
-
-          // ── 백엔드 안전망: 지정된 실제사용설비가 해당 부품의 설비목록에 없는 값이면 차단 ──
-          const invalidUnitItems = items.filter(item => {
-            const matched = inventoryData.find(d =>
-              String(d.모델명 || '').replace(/\s+/g, '').toLowerCase() === String(item.모델명 || '').replace(/\s+/g, '').toLowerCase() &&
-              d.원본시트 === item.원본시트
-            );
-            if (!matched || !matched.isMultiUnit || !item.실제사용설비) return false;
-            return !matched.설비목록.includes(item.실제사용설비.trim());
-          });
-
-          if (invalidUnitItems.length > 0) {
-            const modelNames = invalidUnitItems.map(i => i.모델명).join(', ');
-            const clarifyMsg = `⚠️ 입력하신 호기가 **${modelNames}**의 실제 호기 목록과 일치하지 않습니다. 정확한 호기명을 다시 확인해주세요.`;
-            console.log(`🚫 다중호기 호기 불일치 차단: ${modelNames}`);
-            return res.json({ success: true, message: clarifyMsg, inventoryUpdated: false, updateResult: null, timestamp: new Date().toISOString() });
-          }
         }
 
         for (const item of items) {
@@ -1279,19 +1210,27 @@ ${multiUnitItemsList}
             targetItem.최종수정시각 = getKSTDate();
             targetItem.작업자 = user || 'AI 어시스턴트';
 
-            // 공통부품/다중호기부품인 경우 실제사용설비를 이력에 반영
+            // ── 재고그룹 동기화: 같은 모델명+원본시트를 가진 다른 행(다른 호기)도 함께 수량 반영 ──
+            const groupKey = targetItem.재고그룹키 || getInventoryGroupKey(targetItem);
+            if (groupKey) {
+              inventoryData.forEach(other => {
+                if (other.id === targetItem.id) return;
+                const otherKey = other.재고그룹키 || getInventoryGroupKey(other);
+                if (otherKey === groupKey) {
+                  other.현재수량 = targetItem.현재수량;
+                  other.최종수정시각 = targetItem.최종수정시각;
+                  other.작업자 = targetItem.작업자;
+                }
+              });
+            }
+
+            // 공통부품인 경우 실제사용설비를 이력에 반영
             const logItem = { ...targetItem };
             if (item.실제사용설비) {
+              logItem.적용설비 = item.실제사용설비;
               logItem.표준설비명 = item.실제사용설비;
-              if (targetItem.isMultiUnit) {
-                // 다중호기 결합 부품: 엑셀 원본 적용설비 표기(결합형)는 유지, 표준설비명만 개별호기로 override
-                console.log(`🏭 다중호기 부품 실제 사용 호기: ${item.실제사용설비}`);
-              } else {
-                // 공통 시트 부품
-                logItem.적용설비 = item.실제사용설비;
-                logItem.isCommonPart = true;
-                console.log(`🏭 공통부품 실제 사용 설비: ${item.실제사용설비}`);
-              }
+              logItem.isCommonPart = true;
+              console.log(`🏭 공통부품 실제 사용 설비: ${item.실제사용설비}`);
             }
 
             addLog(action, logItem, finalChange, user || 'AI 어시스턴트');
