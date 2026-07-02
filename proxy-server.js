@@ -299,9 +299,17 @@ function getInventoryGroupKey(item) {
   return `${sheet}::${groupId}`;
 }
 
-// 설비명에 "#숫자" 호기 표기가 있는지 확인 (예: "마블충전기#3 (1공장)")
+// 설비명에 "#숫자" 또는 "숫자호기" 호기 표기가 있는지 확인 (예: "마블충전기#3 (1공장)", "마블충전기 3호기")
 function hasUnitNumber(name) {
-  return /#\s*\d+/.test(String(name || ''));
+  return /#\s*\d+/.test(String(name || '')) || /\d+\s*호기/.test(String(name || ''));
+}
+
+// item이 호기 표기를 갖는지 판단 — 표준설비명(제조 시트 매핑 결과)뿐 아니라
+// 원본 적용설비도 함께 검사한다. '제조' 시트의 "표기 통일" 매핑이 실수로
+// 호기 번호(#3 등)를 지워버려도, 원본 적용설비에 호기 표기가 남아있으면
+// 이 항목은 여전히 호기별로 분리 유지되어야 하므로 (공통) 병합 대상에서 제외한다.
+function itemHasUnitNumber(item) {
+  return hasUnitNumber(item.표준설비명) || hasUnitNumber(item.적용설비);
 }
 
 // 전체 데이터에서 공통부품 자동 판별 후 표준설비명 override
@@ -312,8 +320,8 @@ function applyCommonEquipment(allData) {
   // 모델명별로 어떤 베이스 설비에 쓰이는지 집계 — 호기표기 있는 항목은 집계 대상에서 제외
   const modelToBaseSets = {}; // { '모델명': Set<베이스설비명> }
   allData.forEach(item => {
+    if (itemHasUnitNumber(item)) return; // 호기 표기 있는 설비는 자동판별 대상 아님
     const stdName = item.표준설비명 || item.적용설비;
-    if (hasUnitNumber(stdName)) return; // 호기 표기 있는 설비는 자동판별 대상 아님
     const base = getEquipmentBase(stdName);
     const model = String(item.모델명 || '').trim();
     if (!model) return;
@@ -323,8 +331,8 @@ function applyCommonEquipment(allData) {
 
   // 같은 베이스에서 2개 이상 설비에 걸친 모델 → (공통) override
   allData.forEach(item => {
+    if (itemHasUnitNumber(item)) return; // 호기 표기 있는 설비는 (공통) override 대상 아님
     const stdName = item.표준설비명 || item.적용설비;
-    if (hasUnitNumber(stdName)) return; // 호기 표기 있는 설비는 (공통) override 대상 아님
     const base = getEquipmentBase(stdName);
     const model = String(item.모델명 || '').trim();
     if (!model) return;
@@ -332,8 +340,8 @@ function applyCommonEquipment(allData) {
     // 같은 베이스 설비들 중 이 모델이 2개 이상의 서로 다른 표준설비명에 존재하는지 확인
     // (여기서도 호기 표기 있는 항목은 비교군에서 제외)
     const sameBaseItems = allData.filter(d => {
+      if (itemHasUnitNumber(d)) return false;
       const dStdName = d.표준설비명 || d.적용설비;
-      if (hasUnitNumber(dStdName)) return false;
       const dBase = getEquipmentBase(dStdName);
       return dBase === base && String(d.모델명 || '').trim() === model;
     });
