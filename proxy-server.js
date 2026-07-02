@@ -22,7 +22,6 @@ const CONFIG = {
   clientSecret: process.env.CLIENT_SECRET,
   redirectUri: process.env.REDIRECT_URI || 'http://localhost:5000/callback',
   inventorySheets: ['충전', '타정', '공통'],
-  equipmentStandardSheet: '제조',       // 설비명 표준화 테이블 시트
   facilityLogSheetName: '설비이력',     // 설비별 이력 시트
   logSheetName: '사용내역종합',
   teamsWebhookUrl: process.env.TEAMS_WEBHOOK_URL  // Teams Incoming Webhook URL
@@ -217,11 +216,6 @@ let cachedData = null;
 let lastFetchTime = null;
 const CACHE_DURATION = 60 * 1000;
 
-// 설비명 표준화 테이블 캐시
-let equipmentStandardMap = null;   // { '원본설비명': '표준설비명' }
-let lastEquipmentFetchTime = null;
-const EQUIPMENT_CACHE_DURATION = 5 * 60 * 1000; // 5분
-
 // 설비이력 메모리 버퍼
 let facilityLogs = [];
 
@@ -231,48 +225,14 @@ function invalidateCache() {
 }
 
 // ============================================================
-// 설비명 표준화 (제조 시트 기반)
+// 설비명 정리 (공백/줄바꿈만 정리 — 별도 매핑 테이블 사용 안 함)
 // ============================================================
-// 제조 시트 컬럼 구조:
-//   원본설비명 | 표준설비명
-//
-// 공통부품 자동 판별 규칙:
-//   설비명 베이스(#숫자 제거)가 같고, 동일 모델명이 2개 이상 설비에 존재하면
-//   → 표준설비명이 "(공통)"으로 끝나도록 백엔드에서 override
-//
-async function loadEquipmentStandards(workbook) {
-  const now = Date.now();
-  if (equipmentStandardMap && lastEquipmentFetchTime && (now - lastEquipmentFetchTime) < EQUIPMENT_CACHE_DURATION) {
-    return equipmentStandardMap;
-  }
-
-  const sheet = workbook.Sheets[CONFIG.equipmentStandardSheet];
-  equipmentStandardMap = {};
-
-  if (sheet) {
-    const rows = XLSX.utils.sheet_to_json(sheet);
-    rows.forEach(row => {
-      const original = String(row['원본설비명'] || '').trim();
-      const standard = String(row['표준설비명'] || '').trim();
-      if (original && standard) {
-        equipmentStandardMap[original] = standard;
-      }
-    });
-    console.log(`🏭 설비 표준화 테이블 로드: ${Object.keys(equipmentStandardMap).length}개 매핑`);
-  } else {
-    console.warn(`⚠️ "${CONFIG.equipmentStandardSheet}" 시트 없음 — 설비명 표준화 건너뜀`);
-  }
-
-  lastEquipmentFetchTime = now;
-  return equipmentStandardMap;
-}
-
-// 원본설비명 → 표준설비명 변환
+// ⚠️ 과거에는 '제조' 시트("원본설비명→표준설비명" 매핑 테이블)를 참조했으나,
+//    실제로는 관리되지 않는 사문화된 시트였고, 매핑 실수로 호기 표기(#3 등)가
+//    지워지는 등 부작용만 있어 완전히 제거했다.
+//    이제 적용설비 원본 문자열의 공백/줄바꿈만 정리해서 그대로 표준설비명으로 사용한다.
 function normalizeEquipment(originalName) {
-  // 엑셀 셀 내 줄바꿈(Alt+Enter) 제거 후 공백 정리
-  originalName = String(originalName || '').replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
-  if (!equipmentStandardMap) return originalName;
-  return equipmentStandardMap[originalName] || originalName;
+  return String(originalName || '').replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
 // 설비명 베이스 추출: "제트프레스 #1 (1공장)" → "제트프레스"
@@ -304,10 +264,9 @@ function hasUnitNumber(name) {
   return /#\s*\d+/.test(String(name || '')) || /\d+\s*호기/.test(String(name || ''));
 }
 
-// item이 호기 표기를 갖는지 판단 — 표준설비명(제조 시트 매핑 결과)뿐 아니라
-// 원본 적용설비도 함께 검사한다. '제조' 시트의 "표기 통일" 매핑이 실수로
-// 호기 번호(#3 등)를 지워버려도, 원본 적용설비에 호기 표기가 남아있으면
-// 이 항목은 여전히 호기별로 분리 유지되어야 하므로 (공통) 병합 대상에서 제외한다.
+// item이 호기 표기를 갖는지 판단 — 표준설비명뿐 아니라 원본 적용설비도 함께 검사한다.
+// 표준설비명 계산 과정(공백/줄바꿈 정리)에서 호기 표기가 유실될 가능성에 대비한
+// 이중 방어 로직이다.
 function itemHasUnitNumber(item) {
   return hasUnitNumber(item.표준설비명) || hasUnitNumber(item.적용설비);
 }
@@ -416,9 +375,6 @@ async function fetchExcelFromOneDrive() {
 
     const workbook = XLSX.read(Buffer.from(response.data), { type: 'buffer' });
     let allMappedData = [];
-
-    // 설비명 표준화 테이블 먼저 로드 (제조 시트)
-    await loadEquipmentStandards(workbook);
 
     // 재고 시트 순회 (충전, 타정, 공통)
     CONFIG.inventorySheets.forEach(sheetName => {
@@ -557,24 +513,6 @@ async function updateExcelOnOneDrive(data, retries = 3) {
         const facilityRows = [...facilityLogs].reverse();
         const facilityWs = XLSX.utils.json_to_sheet(facilityRows);
         XLSX.utils.book_append_sheet(workbook, facilityWs, CONFIG.facilityLogSheetName);
-      }
-
-      // 설비명 표준화 시트(제조)는 읽기 전용 — 원본 그대로 복원
-      try {
-        const origAccessToken2 = await getValidAccessToken();
-        const origResponse = await axios.get(
-          `https://graph.microsoft.com/v1.0/me/drive/root:/${CONFIG.excelFileName}:/content`,
-          { headers: { 'Authorization': `Bearer ${origAccessToken2}` }, responseType: 'arraybuffer' }
-        );
-        const origWb = XLSX.read(Buffer.from(origResponse.data), { type: 'buffer' });
-        if (origWb.Sheets[CONFIG.equipmentStandardSheet]) {
-          workbook.Sheets[CONFIG.equipmentStandardSheet] = origWb.Sheets[CONFIG.equipmentStandardSheet];
-          if (!workbook.SheetNames.includes(CONFIG.equipmentStandardSheet)) {
-            workbook.SheetNames.push(CONFIG.equipmentStandardSheet);
-          }
-        }
-      } catch (e) {
-        console.warn('⚠️ 설비 표준화 시트 복원 스킵:', e.message);
       }
 
       const excelBuffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
