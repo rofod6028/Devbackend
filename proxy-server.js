@@ -500,6 +500,17 @@ async function fetchExcelFromOneDrive() {
     applyCommonEquipment(nonCommonData);
     allMappedData = [...nonCommonData, ...commonTabData];
 
+    // ── 임시 디버그 로그: 마블충전기#3/#4 데이터 확인 ──
+    const debugItems = allMappedData.filter(d => String(d.적용설비 || '').includes('마블충전기#3') || String(d.적용설비 || '').includes('마블충전기#4'));
+    console.log(`🔍 [DEBUG] 마블충전기#3/#4 관련 데이터 ${debugItems.length}건:`);
+    debugItems.slice(0, 10).forEach(d => {
+      console.log(`   id=${d.id} 모델명="${d.모델명}" 적용설비="${d.적용설비}" 표준설비명="${d.표준설비명}" isCommonPart=${d.isCommonPart} 재고그룹키="${d.재고그룹키}" 현재수량=${d.현재수량}`);
+    });
+    const 마블3그룹 = allMappedData.filter(d => d.표준설비명 === '마블충전기#3 (1공장)');
+    const 마블4그룹 = allMappedData.filter(d => d.표준설비명 === '마블충전기#4 (1공장)');
+    console.log(`🔍 [DEBUG] 표준설비명 === '마블충전기#3 (1공장)' 매칭: ${마블3그룹.length}건`);
+    console.log(`🔍 [DEBUG] 표준설비명 === '마블충전기#4 (1공장)' 매칭: ${마블4그룹.length}건`);
+
     cachedData = allMappedData;
     lastFetchTime = now;
     console.log(`✅ 데이터 로드 완료: 총 ${allMappedData.length}건`);
