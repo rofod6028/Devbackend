@@ -225,6 +225,9 @@ const EQUIPMENT_CACHE_DURATION = 5 * 60 * 1000; // 5분
 // 설비이력 메모리 버퍼
 let facilityLogs = [];
 
+// 재고그룹ID 유실 조기 감지용 (직전에 확인된 그룹 연결 행 수)
+let lastKnownGroupedRowCount = 0;
+
 function invalidateCache() {
   cachedData = null;
   lastFetchTime = null;
@@ -469,6 +472,14 @@ async function fetchExcelFromOneDrive() {
         group.forEach(g => { g.현재수량 = latest.현재수량; });
         console.log(`🔗 재고그룹 수량 불일치 감지 → 동기화: ${group[0].모델명} (${group[0].원본시트}) → ${latest.현재수량}개`);
       });
+
+      // ── 무결성 안전장치: 직전에 그룹ID가 붙은 행이 존재했는데, 이번 로드에서
+      // 갑자기 0건이 됐다면 저장 과정에서 재고그룹ID 컬럼이 유실된 것일 가능성이 매우 높음 ──
+      const groupedNow = allMappedData.filter(d => d.재고그룹ID).length;
+      if (lastKnownGroupedRowCount > 0 && groupedNow === 0) {
+        console.error(`🚨🚨 [무결성 경고] 직전까지 재고그룹ID가 있던 행이 ${lastKnownGroupedRowCount}건이었는데, 이번 로드에서는 0건입니다. 엑셀 저장 시 재고그룹ID 컬럼이 유실되었을 가능성이 높습니다! 다중 호기 재고 동기화가 중단됩니다.`);
+      }
+      if (groupedNow > 0) lastKnownGroupedRowCount = groupedNow;
     }
 
     // 로그 시트 로드 (사용내역종합) — memoryLogs가 이미 있으면 덮어쓰지 않음
@@ -532,6 +543,14 @@ async function updateExcelOnOneDrive(data, retries = 3) {
       const accessToken = await getValidAccessToken();
       const workbook = XLSX.utils.book_new();
 
+      // ── 데이터 무결성 안전장치: 저장 직전, 그룹ID를 가진 행 수를 기록해두고
+      // 저장 후 다음 로드 시점에 이 수와 비교해 '컬럼 유실'을 조기에 감지한다.
+      // (과거 실수로 재고그룹ID를 excelRows에서 빠뜨려 그룹 연결이 전부 끊긴 사고가 있었음)
+      const groupedBefore = data.filter(d => String(d.재고그룹ID || '').trim()).length;
+      if (groupedBefore > 0) {
+        lastKnownGroupedRowCount = groupedBefore;
+      }
+
       // 재고 시트들 저장
       CONFIG.inventorySheets.forEach(sheetName => {
         const sheetData = data.filter(item => item.원본시트 === sheetName);
@@ -545,8 +564,15 @@ async function updateExcelOnOneDrive(data, retries = 3) {
           '최종수정시각': item.최종수정시각 || '',
           '작업자': item.작업자 || '',
           '용도': item.용도 || '',
-          '보관장소': item.보관장소 || '위치 미지정'
+          '보관장소': item.보관장소 || '위치 미지정',
+          '재고그룹ID': item.재고그룹ID || ''
         }));
+        // 저장 직전 검증: 원본에 그룹ID가 있던 시트인데 쓰기용 행에서 사라졌다면 즉시 경고
+        const groupedInRows = excelRows.filter(r => r['재고그룹ID']).length;
+        const groupedInSource = sheetData.filter(d => String(d.재고그룹ID || '').trim()).length;
+        if (groupedInSource > 0 && groupedInRows !== groupedInSource) {
+          console.error(`🚨 [무결성 경고] "${sheetName}" 시트: 재고그룹ID가 있는 행 ${groupedInSource}건 중 ${groupedInRows}건만 저장용 데이터에 반영됨! 컬럼 매핑을 확인하세요.`);
+        }
         XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(excelRows), sheetName);
       });
 
