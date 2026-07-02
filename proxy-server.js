@@ -285,15 +285,18 @@ function getEquipmentBase(name) {
 }
 
 // ============================================================
-// 재고그룹 키 생성 — 같은 모델명 + 원본시트를 가진 행들은 하나의 재고그룹으로 간주
-// (엑셀에서 "충전기#1 (1공장)", "충전기#2 (1공장)"처럼 호기별로 행이 나뉘어 있어도
-//  같은 부품(모델명 동일)을 공유 재고로 관리하는 경우, 이 키로 묶어서 수량을 동기화)
+// 재고그룹 키 생성 — "재고그룹ID" 컬럼에 명시된 행들만 하나의 재고그룹으로 간주
+// ⚠️ 과거에는 "같은 시트 + 같은 모델명"이면 설비가 전혀 달라도 자동으로 묶었으나,
+//    이는 우연히 모델명이 같은 무관한 부품(볼트, 온도센서 등 범용 규격품)까지
+//    잘못 하나의 재고로 합쳐버리는 위험한 방식이었다.
+//    이제는 엑셀의 "재고그룹ID" 컬럼에 값이 명시적으로 입력된 행끼리만 묶는다.
+//    (원래 결합설비였다가 호기별로 행이 분리된 부품들에 한해 재고관리팀이 직접 부여)
 // ============================================================
 function getInventoryGroupKey(item) {
-  const model = String(item.모델명 || '').trim().toLowerCase();
+  const groupId = String(item.재고그룹ID || '').trim();
+  if (!groupId) return null; // 그룹ID가 없으면 완전히 독립적인 재고로 취급
   const sheet = String(item.원본시트 || '').trim();
-  if (!model) return null;
-  return `${sheet}::${model}`;
+  return `${sheet}::${groupId}`;
 }
 
 // 설비명에 "#숫자" 호기 표기가 있는지 확인 (예: "마블충전기#3 (1공장)")
@@ -440,6 +443,7 @@ async function fetchExcelFromOneDrive() {
           작업자: row['작업자'] || '',
           용도: row['용도'] || '',
           보관장소: foundKey ? row[foundKey] : '위치 미지정',
+          재고그룹ID: String(row['재고그룹ID'] || '').trim(),
           isCommonPart: false
         };
         item.재고그룹키 = getInventoryGroupKey(item);
