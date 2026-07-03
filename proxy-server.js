@@ -231,13 +231,29 @@ function invalidateCache() {
 //    실제로는 관리되지 않는 사문화된 시트였고, 매핑 실수로 호기 표기(#3 등)가
 //    지워지는 등 부작용만 있어 완전히 제거했다.
 //    이제 적용설비 원본 문자열의 공백/줄바꿈만 정리해서 그대로 표준설비명으로 사용한다.
+// ============================================================
+// 전각(全角) 특수문자 → 반각 정규화
+// ⚠️ 엑셀에서 한글 입력기를 쓰다 실수로 전각 샵(＃, U+FF03) 등이 섞여 들어가면
+//    "#3" 형태를 찾는 정규식이 전혀 인식하지 못해 호기 표기가 없는 것처럼
+//    오판되는 심각한 버그가 생긴다 (예: applyCommonEquipment가 "마블충전기#3"을
+//    "마블충전기 (공통)"으로 잘못 합쳐버림). 모든 판별 로직에 들어가기 전에
+//    이 정규화를 거쳐서, 어떤 문자가 섞여 들어와도 안전하게 반각으로 통일한다.
+// ============================================================
+function normalizeSpecialChars(str) {
+  return String(str || '')
+    .replace(/＃/g, '#')   // 전각 샵 → 반각 샵
+    .replace(/[０-９]/g, ch => String.fromCharCode(ch.charCodeAt(0) - 0xFEE0)) // 전각 숫자 → 반각 숫자
+    .replace(/（/g, '(')
+    .replace(/）/g, ')');
+}
+
 function normalizeEquipment(originalName) {
-  return String(originalName || '').replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
+  return normalizeSpecialChars(String(originalName || '').replace(/[\r\n]+/g, ' ')).replace(/\s+/g, ' ').trim();
 }
 
 // 설비명 베이스 추출: "제트프레스 #1 (1공장)" → "제트프레스"
 function getEquipmentBase(name) {
-  return String(name || '')
+  return normalizeSpecialChars(name)
     .replace(/#\s*\d+/g, '')     // #1, # 2 등 제거
     .replace(/\d+호기/g, '')     // 1호기, 2호기 제거
     .replace(/\s+/g, ' ')
@@ -260,8 +276,10 @@ function getInventoryGroupKey(item) {
 }
 
 // 설비명에 "#숫자" 또는 "숫자호기" 호기 표기가 있는지 확인 (예: "마블충전기#3 (1공장)", "마블충전기 3호기")
+// 전각 샵(＃) 등 변형 문자도 normalizeSpecialChars로 먼저 통일한 뒤 검사한다.
 function hasUnitNumber(name) {
-  return /#\s*\d+/.test(String(name || '')) || /\d+\s*호기/.test(String(name || ''));
+  const n = normalizeSpecialChars(name);
+  return /#\s*\d+/.test(n) || /\d+\s*호기/.test(n);
 }
 
 // item이 호기 표기를 갖는지 판단 — 표준설비명뿐 아니라 원본 적용설비도 함께 검사한다.
