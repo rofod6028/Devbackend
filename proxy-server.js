@@ -21,9 +21,9 @@ const CONFIG = {
   clientId: process.env.CLIENT_ID,
   clientSecret: process.env.CLIENT_SECRET,
   redirectUri: process.env.REDIRECT_URI || 'http://localhost:5000/callback',
-  inventorySheets: ['스페어파트'],
-  facilityMasterSheet: '설비마스터',    // 설비 그룹→개별 호기 매핑 테이블
-  facilityLogSheetName: '설비이력',     // 설비별 이력 시트
+  inventorySheet: '공통',                       // 실제 부품 재고 데이터의 유일한 원본 시트
+  facilityListSheets: ['충전', '타정'],          // 설비명(적용설비) 목록만 있는 시트들 — 카드 UI 생성용
+  facilityLogSheetName: '설비이력',              // 설비별 이력 시트
   logSheetName: '사용내역종합',
   teamsWebhookUrl: process.env.TEAMS_WEBHOOK_URL  // Teams Incoming Webhook URL
 };
@@ -235,7 +235,7 @@ function invalidateCache() {
 // ============================================================
 // 전각(全角) 특수문자 → 반각 정규화
 // ⚠️ 엑셀에서 한글 입력기를 쓰다 실수로 전각 샵(＃, U+FF03) 등이 섞여 들어가면
-//    설비명 매칭(설비마스터 대조)이 실패할 수 있다. 모든 판별 로직에 들어가기 전에
+//    설비명 매칭(설비 목록 대조)이 실패할 수 있다. 모든 판별 로직에 들어가기 전에
 //    이 정규화를 거쳐서, 어떤 문자가 섞여 들어와도 안전하게 반각으로 통일한다.
 // ============================================================
 function normalizeSpecialChars(str) {
@@ -251,62 +251,37 @@ function normalizeEquipment(originalName) {
 }
 
 // ============================================================
-// 설비마스터 기반 설비 판별
+// 설비 목록(카드 UI 생성용) 로드
 // ============================================================
-// '설비마스터' 시트 구조: 원본시트 | 소속그룹(적용설비 매칭용) | 설비명(호기별)
-//   - 여러 호기로 나뉘는 설비(예: 마블충전기#1~4)는 "소속그룹" 하나에 여러 "설비명" 행으로 등록
-//   - 스페어파트 시트의 "적용설비" 값이 이 "소속그룹"과 일치하면, 해당 그룹에 속한
-//     호기 목록 중 실사용자가 어느 것인지 선택/확인하도록 한다.
-//   - "적용설비"가 이미 특정 호기 하나를 직접 가리키면(설비명과 일치) 확인 절차 없이 그대로 사용.
-//   - 어느 쪽에도 매칭되지 않고 "~관련"/"기타" 같은 범용 태그이면, 전체 설비 목록 중에서 선택.
+// '충전'/'타정' 시트는 이제 부품 데이터를 전혀 담지 않고, 헤더 '적용설비' 하나만 있는
+// 단순 설비명 목록이다. 실제 부품 재고는 오직 '공통' 시트에만 존재하며,
+// 모든 부품은 출고 시 "어느 설비에 사용했는지" 확인 절차를 거친다 (기존 공통부품 흐름과 동일).
+// 이 목록은 카드 UI 구성과, 출고 시 실제사용설비 값 검증(오타 방지) 용도로만 쓰인다.
 // ============================================================
-let facilityMasterCache = null; // { groupToUnits, unitToSheet, allUnits, rawRows }
+let facilityListCache = null; // { 충전: [...], 타정: [...], all: [...] }
 
-async function loadFacilityMaster(workbook) {
-  const sheet = workbook.Sheets[CONFIG.facilityMasterSheet];
-  const groupToUnits = {};   // { 소속그룹: [{설비명, 원본시트}] }
-  const unitToSheet = {};    // { 설비명: 원본시트 }
-  const allUnits = [];       // [{설비명, 원본시트, 소속그룹}]
-  const rawRows = [];
+async function loadFacilityLists(workbook) {
+  const lists = {};
+  let all = [];
 
-  if (sheet) {
+  CONFIG.facilityListSheets.forEach(sheetName => {
+    const sheet = workbook.Sheets[sheetName];
+    if (!sheet) {
+      console.warn(`⚠️ 설비 목록 시트 "${sheetName}"을 찾을 수 없습니다.`);
+      lists[sheetName] = [];
+      return;
+    }
     const rows = XLSX.utils.sheet_to_json(sheet);
-    rows.forEach(row => {
-      const 원본시트 = String(row['원본시트'] || '').trim();
-      const 소속그룹 = normalizeEquipment(row['소속그룹(적용설비 매칭용)']);
-      const 설비명 = normalizeEquipment(row['설비명(호기별)']);
-      if (!설비명) return;
-      rawRows.push(row);
-      unitToSheet[설비명] = 원본시트 || '미분류';
-      allUnits.push({ 설비명, 원본시트: 원본시트 || '미분류', 소속그룹 });
-      if (소속그룹) {
-        (groupToUnits[소속그룹] = groupToUnits[소속그룹] || []).push({ 설비명, 원본시트: 원본시트 || '미분류' });
-      }
-    });
-    console.log(`🏭 설비마스터 로드: 그룹 ${Object.keys(groupToUnits).length}개, 개별 설비 ${allUnits.length}개`);
-  } else {
-    console.warn(`⚠️ "${CONFIG.facilityMasterSheet}" 시트를 찾을 수 없습니다 — 설비 확인 기능이 제한됩니다.`);
-  }
+    const names = rows
+      .map(r => normalizeEquipment(r['적용설비']))
+      .filter(Boolean);
+    lists[sheetName] = names;
+    all = all.concat(names);
+    console.log(`🏭 "${sheetName}" 설비 목록 로드: ${names.length}개`);
+  });
 
-  facilityMasterCache = { groupToUnits, unitToSheet, allUnits, rawRows };
-  return facilityMasterCache;
-}
-
-// 스페어파트 한 행의 "적용설비" 원본 문자열을 판별한다.
-// ── 새 방향 (2026-07) ──
-// 적용설비 컬럼에 뭐라고 적혀 있든(그룹명/개별호기명/관련/기타/빈값 등) 전부 무시하고
-// "실사용 설비 확인이 필요한 공용 부품"으로 통일 처리한다.
-// 실제 설비 목록은 오직 '설비마스터' 시트가 정의하며, 사용/입고 시 항상 그 전체 목록 중에서
-// 어느 설비인지 선택(확인)하게 한다. (기존의 "이미 특정 호기라 확인 불필요" 예외를 없앰)
-function resolveFacility(rawEquipRaw, fm) {
-  const cleaned = normalizeEquipment(rawEquipRaw);
-  const allUnits = fm.allUnits.map(u => u.설비명).sort();
-  return {
-    원본시트: '스페어파트',
-    표준설비명: cleaned || '(미지정)',
-    isCommonPart: true,
-    후보설비목록: allUnits
-  };
+  facilityListCache = { ...lists, all: [...new Set(all)] };
+  return facilityListCache;
 }
 
 // ============================================================
@@ -369,36 +344,33 @@ async function fetchExcelFromOneDrive() {
     const workbook = XLSX.read(Buffer.from(response.data), { type: 'buffer' });
     let allMappedData = [];
 
-    // 설비마스터(그룹→호기 매핑) 먼저 로드
-    const fm = await loadFacilityMaster(workbook);
+    // 설비 목록(카드 UI용) 먼저 로드 — 충전/타정 시트는 이제 적용설비 목록만 담고 있음
+    const facilityLists = await loadFacilityLists(workbook);
 
-    // 스페어파트 시트 하나만 순회
-    CONFIG.inventorySheets.forEach(sheetName => {
-      const worksheet = workbook.Sheets[sheetName];
-      if (!worksheet) {
-        console.warn(`⚠️ 시트 "${sheetName}"을 찾을 수 없습니다`);
-        return;
-      }
-
+    // 공통 시트 하나만 순회 — 실제 부품 재고의 유일한 원본
+    const worksheet = workbook.Sheets[CONFIG.inventorySheet];
+    if (!worksheet) {
+      console.warn(`⚠️ 시트 "${CONFIG.inventorySheet}"을 찾을 수 없습니다`);
+    } else {
       const jsonData = XLSX.utils.sheet_to_json(worksheet);
-      console.log(`✅ "${sheetName}" 시트: ${jsonData.length}개 항목`);
+      console.log(`✅ "${CONFIG.inventorySheet}" 시트: ${jsonData.length}개 항목`);
 
-      const mappedData = jsonData.map((row, index) => {
+      allMappedData = jsonData.map((row, index) => {
         const rowKeys = Object.keys(row);
         const foundKey = rowKeys.find(key => key.trim() === '보관장소');
         const rawEquip = row['적용설비'] || '';
-        const resolved = resolveFacility(rawEquip, fm);
+        const stdEquip = normalizeEquipment(rawEquip);
 
         return {
-          id: `${sheetName}_${index + 1}`,
-          원본시트: resolved.원본시트,          // UI 상단 탭 분류(충전/타정/공통/미분류) — 화면 표시용, 실제 시트는 스페어파트 하나뿐
+          id: `${CONFIG.inventorySheet}_${index + 1}`,
+          원본시트: CONFIG.inventorySheet,       // 이제 모든 부품이 '공통' 소속
           대분류: row['대분류'] || '미분류',
           부품종류: row['부품종류'] || '',
           모델명: row['모델명'] || '',
-          적용설비: row['적용설비'] || '',      // 엑셀 원본 그대로 (그룹명 또는 특정 설비명)
-          표준설비명: resolved.표준설비명,
-          isCommonPart: resolved.isCommonPart,  // true면 실사용 설비 확인 필요 (스페어파트는 전부 true)
-          후보설비목록: resolved.후보설비목록,   // 확인 시 선택 가능한 설비마스터 전체 목록
+          적용설비: row['적용설비'] || '',        // 엑셀 원본 그대로 (참고/필터용)
+          표준설비명: stdEquip,
+          isCommonPart: true,                    // 모든 부품이 실사용 설비 확인 절차를 거침
+          후보설비목록: facilityLists.all,        // 확인 시 선택 가능한 전체 설비 목록
           현재수량: Number(row['현재수량']) || 0,
           최소보유수량: Number(row['최소보유수량']) || 0,
           최종수정시각: row['최종수정시각'] || '',
@@ -407,12 +379,11 @@ async function fetchExcelFromOneDrive() {
           보관장소: foundKey ? row[foundKey] : '위치 미지정'
         };
       });
-      allMappedData = [...allMappedData, ...mappedData];
-    });
+    }
 
-    // 설비마스터가 비어있으면 확인 절차 자체가 불가능하므로 경고
-    if ((facilityMasterCache?.allUnits || []).length === 0) {
-      console.warn(`⚠️ 설비마스터 시트가 비어있습니다 — 부품 사용 시 설비 선택지가 제공되지 않습니다.`);
+    // 설비 목록이 비어있으면 확인 절차 자체가 불가능하므로 경고
+    if ((facilityListCache?.all || []).length === 0) {
+      console.warn(`⚠️ 설비 목록(충전/타정 시트)이 비어있습니다 — 부품 사용 시 설비 선택지가 제공되지 않습니다.`);
     }
 
     // 로그 시트 로드 (사용내역종합) — memoryLogs가 이미 있으면 덮어쓰지 않음
@@ -459,7 +430,7 @@ async function updateExcelOnOneDrive(data, retries = 3) {
       const accessToken = await getValidAccessToken();
       const workbook = XLSX.utils.book_new();
 
-      // 스페어파트 시트 저장 — 원본시트(화면 표시용 분류)와 무관하게 전체를 하나의 시트에 저장
+      // 공통 시트 저장 — 이제 부품 재고의 유일한 원본
       const excelRows = data.map(item => ({
         '대분류': item.대분류 || '미분류',
         '부품종류': item.부품종류 || '',
@@ -472,17 +443,15 @@ async function updateExcelOnOneDrive(data, retries = 3) {
         '용도': item.용도 || '',
         '보관장소': item.보관장소 || '위치 미지정'
       }));
-      XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(excelRows), '스페어파트');
+      XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(excelRows), CONFIG.inventorySheet);
 
-      // 설비마스터 시트 보존 — 앱에서 직접 수정하지 않는 참조 테이블이므로
-      // 로드 시점에 캐시해둔 원본 행을 그대로 다시 써서 유실 방지
-      if (facilityMasterCache && facilityMasterCache.rawRows.length > 0) {
-        XLSX.utils.book_append_sheet(
-          workbook,
-          XLSX.utils.json_to_sheet(facilityMasterCache.rawRows),
-          CONFIG.facilityMasterSheet
-        );
-      }
+      // 충전/타정 설비명 목록 시트 복원 — 앱에서 직접 수정하지 않는 참조 목록이므로
+      // 로드 시점에 캐시해둔 목록을 그대로 다시 써서 유실 방지 (헤더는 '적용설비' 단일열)
+      CONFIG.facilityListSheets.forEach(sheetName => {
+        const names = facilityListCache?.[sheetName] || [];
+        const rows = names.map(name => ({ '적용설비': name }));
+        XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(rows), sheetName);
+      });
 
       // 로그 시트 저장
       const logRows = [...memoryLogs].reverse();
@@ -685,10 +654,8 @@ function checkAndNotifyLowStock(data) {
 app.get('/api/inventory', async (req, res) => {
   try {
     const data = await fetchExcelFromOneDrive();
-    // 설비마스터(그룹→개별 호기 매핑)도 함께 내려줌 — 프론트엔드가 카드 목록/설비 선택지를
-    // 정확한 "개별 호기" 단위로 구성할 수 있도록 함
-    const facilityMaster = facilityMasterCache?.allUnits || [];
-    res.json({ success: true, data, facilityMaster });
+    // 설비 목록(충전/타정 시트 기반) — 프론트엔드가 카드 목록/설비 선택지를 구성할 때 사용
+    res.json({ success: true, data, facilityLists: facilityListCache || { 충전: [], 타정: [], all: [] } });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -1001,9 +968,9 @@ app.post('/api/ai/chat', async (req, res) => {
     let inventoryData = await fetchExcelFromOneDrive();
 
     // 전체 특정 설비 목록(예시/일반 안내용)
-    const realFacilities = (facilityMasterCache?.allUnits || []).map(u => u.설비명).sort();
+    const realFacilities = (facilityListCache?.all || []).slice().sort();
 
-    // ── 모든 부품이 설비마스터 전체 목록 중에서 실사용 설비를 확인해야 하는 구조 ──
+    // ── 모든 부품이 공통 시트 소속이며, 전체 설비 목록 중에서 실사용 설비를 확인해야 하는 구조 ──
     const inventoryTable = inventoryData.map(item => {
       const stockStatus = item.최소보유수량 > 0 && item.현재수량 <= item.최소보유수량 ? '⚠️부족' : '정상';
       return `모델명:${item.모델명} | 부품종류:${item.부품종류} | 현재수량:${item.현재수량} | 최소보유:${item.최소보유수량} | 재고:${stockStatus}`;
@@ -1094,9 +1061,9 @@ ${realFacilities.join(', ')}
           }
         }
 
-        // 출고 시 실제사용설비가 설비마스터 전체 목록에 있는 정확한 표기인지 검증
+        // 출고 시 실제사용설비가 전체 설비 목록(충전+타정)에 있는 정확한 표기인지 검증
         if (action === '출고') {
-          const allUnitNames = new Set((facilityMasterCache?.allUnits || []).map(u => u.설비명));
+          const allUnitNames = new Set(facilityListCache?.all || []);
           const invalidFacilityItems = items.filter(item => {
             const facRaw = String(item.실제사용설비 || '').trim();
             return facRaw && !allUnitNames.has(facRaw);
