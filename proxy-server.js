@@ -21,7 +21,8 @@ const CONFIG = {
   clientId: process.env.CLIENT_ID,
   clientSecret: process.env.CLIENT_SECRET,
   redirectUri: process.env.REDIRECT_URI || 'http://localhost:5000/callback',
-  inventorySheets: ['충전', '타정', '공통'],
+  inventorySheets: ['스페어파트'],
+  facilityMasterSheet: '설비마스터',    // 설비 그룹→개별 호기 매핑 테이블
   facilityLogSheetName: '설비이력',     // 설비별 이력 시트
   logSheetName: '사용내역종합',
   teamsWebhookUrl: process.env.TEAMS_WEBHOOK_URL  // Teams Incoming Webhook URL
@@ -234,9 +235,7 @@ function invalidateCache() {
 // ============================================================
 // 전각(全角) 특수문자 → 반각 정규화
 // ⚠️ 엑셀에서 한글 입력기를 쓰다 실수로 전각 샵(＃, U+FF03) 등이 섞여 들어가면
-//    "#3" 형태를 찾는 정규식이 전혀 인식하지 못해 호기 표기가 없는 것처럼
-//    오판되는 심각한 버그가 생긴다 (예: applyCommonEquipment가 "마블충전기#3"을
-//    "마블충전기 (공통)"으로 잘못 합쳐버림). 모든 판별 로직에 들어가기 전에
+//    설비명 매칭(설비마스터 대조)이 실패할 수 있다. 모든 판별 로직에 들어가기 전에
 //    이 정규화를 거쳐서, 어떤 문자가 섞여 들어와도 안전하게 반각으로 통일한다.
 // ============================================================
 function normalizeSpecialChars(str) {
@@ -251,87 +250,92 @@ function normalizeEquipment(originalName) {
   return normalizeSpecialChars(String(originalName || '').replace(/[\r\n]+/g, ' ')).replace(/\s+/g, ' ').trim();
 }
 
-// 설비명 베이스 추출: "제트프레스 #1 (1공장)" → "제트프레스"
-function getEquipmentBase(name) {
-  return normalizeSpecialChars(name)
-    .replace(/#\s*\d+/g, '')     // #1, # 2 등 제거
-    .replace(/\d+호기/g, '')     // 1호기, 2호기 제거
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
 // ============================================================
-// 재고그룹 키 생성 — "재고그룹ID" 컬럼에 명시된 행들만 하나의 재고그룹으로 간주
-// ⚠️ 과거에는 "같은 시트 + 같은 모델명"이면 설비가 전혀 달라도 자동으로 묶었으나,
-//    이는 우연히 모델명이 같은 무관한 부품(볼트, 온도센서 등 범용 규격품)까지
-//    잘못 하나의 재고로 합쳐버리는 위험한 방식이었다.
-//    이제는 엑셀의 "재고그룹ID" 컬럼에 값이 명시적으로 입력된 행끼리만 묶는다.
-//    (원래 결합설비였다가 호기별로 행이 분리된 부품들에 한해 재고관리팀이 직접 부여)
+// 설비마스터 기반 설비 판별
 // ============================================================
-function getInventoryGroupKey(item) {
-  const groupId = String(item.재고그룹ID || '').trim();
-  if (!groupId) return null; // 그룹ID가 없으면 완전히 독립적인 재고로 취급
-  const sheet = String(item.원본시트 || '').trim();
-  return `${sheet}::${groupId}`;
-}
+// '설비마스터' 시트 구조: 원본시트 | 소속그룹(적용설비 매칭용) | 설비명(호기별)
+//   - 여러 호기로 나뉘는 설비(예: 마블충전기#1~4)는 "소속그룹" 하나에 여러 "설비명" 행으로 등록
+//   - 스페어파트 시트의 "적용설비" 값이 이 "소속그룹"과 일치하면, 해당 그룹에 속한
+//     호기 목록 중 실사용자가 어느 것인지 선택/확인하도록 한다.
+//   - "적용설비"가 이미 특정 호기 하나를 직접 가리키면(설비명과 일치) 확인 절차 없이 그대로 사용.
+//   - 어느 쪽에도 매칭되지 않고 "~관련"/"기타" 같은 범용 태그이면, 전체 설비 목록 중에서 선택.
+// ============================================================
+let facilityMasterCache = null; // { groupToUnits, unitToSheet, allUnits, rawRows }
 
-// 설비명에 "#숫자" 또는 "숫자호기" 호기 표기가 있는지 확인 (예: "마블충전기#3 (1공장)", "마블충전기 3호기")
-// 전각 샵(＃) 등 변형 문자도 normalizeSpecialChars로 먼저 통일한 뒤 검사한다.
-function hasUnitNumber(name) {
-  const n = normalizeSpecialChars(name);
-  return /#\s*\d+/.test(n) || /\d+\s*호기/.test(n);
-}
+async function loadFacilityMaster(workbook) {
+  const sheet = workbook.Sheets[CONFIG.facilityMasterSheet];
+  const groupToUnits = {};   // { 소속그룹: [{설비명, 원본시트}] }
+  const unitToSheet = {};    // { 설비명: 원본시트 }
+  const allUnits = [];       // [{설비명, 원본시트, 소속그룹}]
+  const rawRows = [];
 
-// item이 호기 표기를 갖는지 판단 — 표준설비명뿐 아니라 원본 적용설비도 함께 검사한다.
-// 표준설비명 계산 과정(공백/줄바꿈 정리)에서 호기 표기가 유실될 가능성에 대비한
-// 이중 방어 로직이다.
-function itemHasUnitNumber(item) {
-  return hasUnitNumber(item.표준설비명) || hasUnitNumber(item.적용설비);
-}
-
-// 전체 데이터에서 공통부품 자동 판별 후 표준설비명 override
-// 주의: 적용설비에 "#숫자"(호기 표기)가 있는 항목은 이 자동판별에서 제외한다.
-// 호기별로 행이 분리된 설비(예: "마블충전기#3", "마블충전기#4")는 같은 모델명을 써도
-// 호기 구분을 유지해야 하므로 (공통)으로 뭉뚱그리지 않는다.
-function applyCommonEquipment(allData) {
-  // 모델명별로 어떤 베이스 설비에 쓰이는지 집계 — 호기표기 있는 항목은 집계 대상에서 제외
-  const modelToBaseSets = {}; // { '모델명': Set<베이스설비명> }
-  allData.forEach(item => {
-    if (itemHasUnitNumber(item)) return; // 호기 표기 있는 설비는 자동판별 대상 아님
-    const stdName = item.표준설비명 || item.적용설비;
-    const base = getEquipmentBase(stdName);
-    const model = String(item.모델명 || '').trim();
-    if (!model) return;
-    if (!modelToBaseSets[model]) modelToBaseSets[model] = new Set();
-    modelToBaseSets[model].add(base);
-  });
-
-  // 같은 베이스에서 2개 이상 설비에 걸친 모델 → (공통) override
-  allData.forEach(item => {
-    if (itemHasUnitNumber(item)) return; // 호기 표기 있는 설비는 (공통) override 대상 아님
-    const stdName = item.표준설비명 || item.적용설비;
-    const base = getEquipmentBase(stdName);
-    const model = String(item.모델명 || '').trim();
-    if (!model) return;
-
-    // 같은 베이스 설비들 중 이 모델이 2개 이상의 서로 다른 표준설비명에 존재하는지 확인
-    // (여기서도 호기 표기 있는 항목은 비교군에서 제외)
-    const sameBaseItems = allData.filter(d => {
-      if (itemHasUnitNumber(d)) return false;
-      const dStdName = d.표준설비명 || d.적용설비;
-      const dBase = getEquipmentBase(dStdName);
-      return dBase === base && String(d.모델명 || '').trim() === model;
+  if (sheet) {
+    const rows = XLSX.utils.sheet_to_json(sheet);
+    rows.forEach(row => {
+      const 원본시트 = String(row['원본시트'] || '').trim();
+      const 소속그룹 = normalizeEquipment(row['소속그룹(적용설비 매칭용)']);
+      const 설비명 = normalizeEquipment(row['설비명(호기별)']);
+      if (!설비명) return;
+      rawRows.push(row);
+      unitToSheet[설비명] = 원본시트 || '미분류';
+      allUnits.push({ 설비명, 원본시트: 원본시트 || '미분류', 소속그룹 });
+      if (소속그룹) {
+        (groupToUnits[소속그룹] = groupToUnits[소속그룹] || []).push({ 설비명, 원본시트: 원본시트 || '미분류' });
+      }
     });
-    const uniqueStdNames = new Set(sameBaseItems.map(d => d.표준설비명 || d.적용설비));
+    console.log(`🏭 설비마스터 로드: 그룹 ${Object.keys(groupToUnits).length}개, 개별 설비 ${allUnits.length}개`);
+  } else {
+    console.warn(`⚠️ "${CONFIG.facilityMasterSheet}" 시트를 찾을 수 없습니다 — 설비 확인 기능이 제한됩니다.`);
+  }
 
-    if (uniqueStdNames.size >= 2) {
-      // 공통 설비명: 베이스명 + "(공통)"
-      item.표준설비명 = base + ' (공통)';
-      item.isCommonPart = true;
-    }
-  });
+  facilityMasterCache = { groupToUnits, unitToSheet, allUnits, rawRows };
+  return facilityMasterCache;
+}
 
-  return allData;
+// 스페어파트 한 행의 "적용설비" 원본 문자열을 보고
+// 원본시트 / 표준설비명 / 설비확인필요여부 / 후보설비목록 을 판별한다.
+function resolveFacility(rawEquipRaw, fm) {
+  const cleaned = normalizeEquipment(rawEquipRaw);
+  const blank = !cleaned || /^(none|nan|null|undefined)$/i.test(cleaned);
+
+  if (blank) {
+    return {
+      원본시트: '공통',
+      표준설비명: '(설비 미지정)',
+      isCommonPart: true,
+      후보설비목록: fm.allUnits.map(u => u.설비명).sort(),
+      미등록: true
+    };
+  }
+
+  // 1) 이미 특정 호기 하나를 직접 가리키는 경우 — 확인 불필요
+  if (fm.unitToSheet[cleaned]) {
+    return { 원본시트: fm.unitToSheet[cleaned], 표준설비명: cleaned, isCommonPart: false, 후보설비목록: null };
+  }
+
+  // 2) 여러 호기로 묶인 소속그룹에 매칭되는 경우 — 그 그룹 내에서만 확인
+  if (fm.groupToUnits[cleaned]) {
+    const units = fm.groupToUnits[cleaned];
+    return {
+      원본시트: units[0]?.원본시트 || '공통',
+      표준설비명: cleaned,
+      isCommonPart: true,
+      후보설비목록: units.map(u => u.설비명).sort()
+    };
+  }
+
+  // 3) "~관련" / "기타" 등 범용 태그 — 특정 설비군에 속하지 않음, 전체 목록에서 선택
+  if (/관련$/.test(cleaned) || cleaned === '기타') {
+    return {
+      원본시트: '공통',
+      표준설비명: cleaned,
+      isCommonPart: true,
+      후보설비목록: fm.allUnits.map(u => u.설비명).sort()
+    };
+  }
+
+  // 4) 설비마스터에 등록되지 않은 개별 설비명 — 그대로 단일 설비로 취급하되 등록 필요 표시
+  return { 원본시트: '미분류', 표준설비명: cleaned, isCommonPart: false, 후보설비목록: null, 미등록: true };
 }
 
 // ============================================================
@@ -394,7 +398,10 @@ async function fetchExcelFromOneDrive() {
     const workbook = XLSX.read(Buffer.from(response.data), { type: 'buffer' });
     let allMappedData = [];
 
-    // 재고 시트 순회 (충전, 타정, 공통)
+    // 설비마스터(그룹→호기 매핑) 먼저 로드
+    const fm = await loadFacilityMaster(workbook);
+
+    // 스페어파트 시트 하나만 순회
     CONFIG.inventorySheets.forEach(sheetName => {
       const worksheet = workbook.Sheets[sheetName];
       if (!worksheet) {
@@ -409,48 +416,34 @@ async function fetchExcelFromOneDrive() {
         const rowKeys = Object.keys(row);
         const foundKey = rowKeys.find(key => key.trim() === '보관장소');
         const rawEquip = row['적용설비'] || '';
-        const stdEquip = normalizeEquipment(String(rawEquip).replace(/[\r\n]+/g, ' ').trim());
+        const resolved = resolveFacility(rawEquip, fm);
 
-        const item = {
+        return {
           id: `${sheetName}_${index + 1}`,
-          원본시트: sheetName,
+          원본시트: resolved.원본시트,          // UI 상단 탭 분류(충전/타정/공통/미분류) — 화면 표시용, 실제 시트는 스페어파트 하나뿐
           대분류: row['대분류'] || '미분류',
           부품종류: row['부품종류'] || '',
           모델명: row['모델명'] || '',
-          적용설비: row['적용설비'] || '',
-          표준설비명: stdEquip,
+          적용설비: row['적용설비'] || '',      // 엑셀 원본 그대로 (그룹명 또는 특정 설비명)
+          표준설비명: resolved.표준설비명,
+          isCommonPart: resolved.isCommonPart,  // true면 실사용 설비 확인 필요
+          후보설비목록: resolved.후보설비목록,   // 확인 필요 시 선택 가능한 구체 설비 목록
+          미등록설비: !!resolved.미등록,         // 설비마스터에 없는 값 — 진단용
           현재수량: Number(row['현재수량']) || 0,
           최소보유수량: Number(row['최소보유수량']) || 0,
           최종수정시각: row['최종수정시각'] || '',
           작업자: row['작업자'] || '',
           용도: row['용도'] || '',
-          보관장소: foundKey ? row[foundKey] : '위치 미지정',
-          재고그룹ID: String(row['재고그룹ID'] || '').trim(),
-          isCommonPart: false
+          보관장소: foundKey ? row[foundKey] : '위치 미지정'
         };
-        item.재고그룹키 = getInventoryGroupKey(item);
-        return item;
       });
       allMappedData = [...allMappedData, ...mappedData];
     });
 
-    // ── 재고그룹 동기화: 같은 모델명+원본시트를 가진 행들은 같은 재고그룹으로 묶어
-    // 그룹 내 수량이 다르면(엑셀 원본이 서로 다른 값으로 저장돼 있던 경우) 최신 수정시각 값으로 통일 ──
-    {
-      const groups = {};
-      allMappedData.forEach(item => {
-        if (!item.재고그룹키) return;
-        (groups[item.재고그룹키] = groups[item.재고그룹키] || []).push(item);
-      });
-      Object.values(groups).forEach(group => {
-        if (group.length < 2) return;
-        const quantities = new Set(group.map(g => g.현재수량));
-        if (quantities.size <= 1) return; // 이미 동일하면 skip
-        // 최종수정시각이 가장 최근인 행의 수량을 그룹 전체 기준값으로 채택
-        const latest = group.reduce((a, b) => (String(b.최종수정시각) > String(a.최종수정시각) ? b : a));
-        group.forEach(g => { g.현재수량 = latest.현재수량; });
-        console.log(`🔗 재고그룹 수량 불일치 감지 → 동기화: ${group[0].모델명} (${group[0].원본시트}) → ${latest.현재수량}개`);
-      });
+    // 설비마스터에 없는(미등록) 적용설비 값을 진단 로그로 안내
+    const unregistered = [...new Set(allMappedData.filter(d => d.미등록설비).map(d => d.적용설비))];
+    if (unregistered.length > 0) {
+      console.warn(`⚠️ 설비마스터에 없는 적용설비 값 ${unregistered.length}개 (임시로 "미분류"/개별설비 처리됨):`, unregistered.slice(0, 20));
     }
 
     // 로그 시트 로드 (사용내역종합) — memoryLogs가 이미 있으면 덮어쓰지 않음
@@ -480,12 +473,6 @@ async function fetchExcelFromOneDrive() {
       }
     }
 
-    // 공통부품 자동 판별 적용 (공통 탭 항목 제외)
-    const nonCommonData = allMappedData.filter(d => d.원본시트 !== '공통');
-    const commonTabData = allMappedData.filter(d => d.원본시트 === '공통');
-    applyCommonEquipment(nonCommonData);
-    allMappedData = [...nonCommonData, ...commonTabData];
-
     cachedData = allMappedData;
     lastFetchTime = now;
     console.log(`✅ 데이터 로드 완료: 총 ${allMappedData.length}건`);
@@ -503,24 +490,30 @@ async function updateExcelOnOneDrive(data, retries = 3) {
       const accessToken = await getValidAccessToken();
       const workbook = XLSX.utils.book_new();
 
-      // 재고 시트들 저장
-      CONFIG.inventorySheets.forEach(sheetName => {
-        const sheetData = data.filter(item => item.원본시트 === sheetName);
-        const excelRows = sheetData.map(item => ({
-          '대분류': item.대분류 || '미분류',
-          '부품종류': item.부품종류 || '',
-          '모델명': item.모델명 || '',
-          '적용설비': item.적용설비 || '',
-          '현재수량': Number(item.현재수량) || 0,
-          '최소보유수량': Number(item.최소보유수량) || 0,
-          '최종수정시각': item.최종수정시각 || '',
-          '작업자': item.작업자 || '',
-          '용도': item.용도 || '',
-          '보관장소': item.보관장소 || '위치 미지정',
-          '재고그룹ID': item.재고그룹ID || ''
-        }));
-        XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(excelRows), sheetName);
-      });
+      // 스페어파트 시트 저장 — 원본시트(화면 표시용 분류)와 무관하게 전체를 하나의 시트에 저장
+      const excelRows = data.map(item => ({
+        '대분류': item.대분류 || '미분류',
+        '부품종류': item.부품종류 || '',
+        '모델명': item.모델명 || '',
+        '적용설비': item.적용설비 || '',
+        '현재수량': Number(item.현재수량) || 0,
+        '최소보유수량': Number(item.최소보유수량) || 0,
+        '최종수정시각': item.최종수정시각 || '',
+        '작업자': item.작업자 || '',
+        '용도': item.용도 || '',
+        '보관장소': item.보관장소 || '위치 미지정'
+      }));
+      XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(excelRows), '스페어파트');
+
+      // 설비마스터 시트 보존 — 앱에서 직접 수정하지 않는 참조 테이블이므로
+      // 로드 시점에 캐시해둔 원본 행을 그대로 다시 써서 유실 방지
+      if (facilityMasterCache && facilityMasterCache.rawRows.length > 0) {
+        XLSX.utils.book_append_sheet(
+          workbook,
+          XLSX.utils.json_to_sheet(facilityMasterCache.rawRows),
+          CONFIG.facilityMasterSheet
+        );
+      }
 
       // 로그 시트 저장
       const logRows = [...memoryLogs].reverse();
@@ -723,7 +716,10 @@ function checkAndNotifyLowStock(data) {
 app.get('/api/inventory', async (req, res) => {
   try {
     const data = await fetchExcelFromOneDrive();
-    res.json({ success: true, data });
+    // 설비마스터(그룹→개별 호기 매핑)도 함께 내려줌 — 프론트엔드가 카드 목록/설비 선택지를
+    // 정확한 "개별 호기" 단위로 구성할 수 있도록 함
+    const facilityMaster = facilityMasterCache?.allUnits || [];
+    res.json({ success: true, data, facilityMaster });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -796,19 +792,6 @@ app.post('/api/inventory/update', async (req, res) => {
     item.현재수량 = 현재수량;
     item.최종수정시각 = getKSTDate();
 
-    // ── 재고그룹 동기화: 같은 모델명+원본시트를 가진 다른 행(다른 호기)도 함께 수량 반영 ──
-    const groupKey = item.재고그룹키 || getInventoryGroupKey(item);
-    if (groupKey) {
-      data.forEach(other => {
-        if (other.id === item.id) return;
-        const otherKey = other.재고그룹키 || getInventoryGroupKey(other);
-        if (otherKey === groupKey) {
-          other.현재수량 = 현재수량;
-          other.최종수정시각 = item.최종수정시각;
-        }
-      });
-    }
-
     const success = await updateExcelOnOneDrive(data);
     if (success) {
       try {
@@ -838,31 +821,16 @@ app.post('/api/inventory/manual-update', async (req, res) => {
       return res.status(404).json({ success: false, message: '항목을 찾을 수 없습니다.' });
     }
 
+    // 설비 확인이 필요한 항목(isCommonPart)은 반드시 common-update로만 처리
+    if (item.isCommonPart && Number(현재수량) < Number(item.현재수량)) {
+      return res.status(400).json({ success: false, message: '이 부품은 실사용 설비 확인이 필요합니다. common-update를 사용해 주세요.' });
+    }
+
     const oldQuantity = item.현재수량;
     const qtyDelta = Number(현재수량) - Number(oldQuantity);
     item.현재수량 = 현재수량;
     item.최종수정시각 = getKSTDate();
     item.작업자 = user || 'Manual';
-
-    // ── 재고그룹 동기화: 같은 모델명+원본시트를 가진 다른 행(다른 호기)도 함께 수량 반영 ──
-    // 예: "충전기#1 (1공장)"과 "충전기#2 (1공장)"가 같은 모델명이면 재고 공유이므로 동시에 갱신
-    const groupKey = item.재고그룹키 || getInventoryGroupKey(item);
-    let syncedCount = 0;
-    if (groupKey) {
-      data.forEach(other => {
-        if (other.id === item.id) return;
-        const otherKey = other.재고그룹키 || getInventoryGroupKey(other);
-        if (otherKey === groupKey) {
-          other.현재수량 = 현재수량;
-          other.최종수정시각 = item.최종수정시각;
-          other.작업자 = item.작업자;
-          syncedCount++;
-        }
-      });
-      if (syncedCount > 0) {
-        console.log(`🔗 재고그룹 동기화: ${item.모델명} (${item.원본시트}) → 같은 그룹 ${syncedCount}개 행에 수량 ${현재수량} 반영`);
-      }
-    }
 
     const success = await updateExcelOnOneDrive(data);
     if (success) {
@@ -873,7 +841,7 @@ app.post('/api/inventory/manual-update', async (req, res) => {
         console.error('📝 로그 기록 오류(무시됨):', logErr.message);
       }
       checkAndNotifyLowStock(data); // Teams 저재고 알림
-      return res.status(200).json({ success: true, message: '업데이트 완료', data: item, syncedGroupCount: syncedCount });
+      return res.status(200).json({ success: true, message: '업데이트 완료', data: item });
     } else {
       return res.status(500).json({ success: false, message: 'OneDrive 업데이트 실패' });
     }
@@ -1028,24 +996,15 @@ app.post('/api/inventory/common-update', async (req, res) => {
     const item = data.find(d => d.id == id);
     if (!item) return res.status(404).json({ success: false, message: '항목을 찾을 수 없습니다.' });
 
+    // 후보설비목록이 정의된 항목이면, 그 목록 안의 설비인지 검증 (오타/임의 입력 방지)
+    if (Array.isArray(item.후보설비목록) && item.후보설비목록.length > 0 && !item.후보설비목록.includes(실제사용설비)) {
+      return res.status(400).json({ success: false, message: `"${실제사용설비}"는 이 부품의 사용 가능 설비 목록에 없습니다.` });
+    }
+
     const oldQuantity = item.현재수량;
     item.현재수량 = 현재수량;
     item.최종수정시각 = getKSTDate();
     item.작업자 = user || 'Manual';
-
-    // ── 재고그룹 동기화: 같은 모델명+원본시트를 가진 다른 행도 함께 수량 반영 ──
-    const groupKey = item.재고그룹키 || getInventoryGroupKey(item);
-    if (groupKey) {
-      data.forEach(other => {
-        if (other.id === item.id) return;
-        const otherKey = other.재고그룹키 || getInventoryGroupKey(other);
-        if (otherKey === groupKey) {
-          other.현재수량 = 현재수량;
-          other.최종수정시각 = item.최종수정시각;
-          other.작업자 = item.작업자;
-        }
-      });
-    }
 
     const success = await updateExcelOnOneDrive(data);
     if (success) {
@@ -1072,49 +1031,16 @@ app.post('/api/ai/chat', async (req, res) => {
     invalidateCache();
     let inventoryData = await fetchExcelFromOneDrive();
 
-    // ── 수정1·2: 공통 시트 여부를 원본시트 기준으로 정확히 판별 ──
-    const commonItems = inventoryData.filter(item => item.원본시트 === '공통');
-    const commonItemsList = commonItems.length > 0
-      ? commonItems.map(item =>
-          `  · ${item.모델명} (${item.부품종류} / 분류: ${item.적용설비} / 용도: ${String(item.용도 || '').slice(0, 40)})`
-        ).join('\n')
-      : '  (없음)';
+    // 전체 특정 설비 목록(예시/일반 안내용)
+    const realFacilities = (facilityMasterCache?.allUnits || []).map(u => u.설비명).sort();
 
-    // 공통 탭 제외 실제 설비 목록 (공통부품 출고 시 선택지 제공용)
-    const realFacilities = [...new Set(
-      inventoryData
-        .filter(d => d.원본시트 !== '공통')
-        .map(d => String(d.표준설비명 || d.적용설비 || '').replace(/[\r\n]+/g, ' ').trim())
-        .filter(Boolean)
-    )].sort();
-
-    // ── 호기 분리 후 동일 모델명이 여러 설비(호기)에 걸쳐 있는 경우 판별 ──
-    // 예: "마블충전기#3 (1공장)"과 "마블충전기#4 (1공장)"에 같은 모델명 CXSM15-100이 있으면
-    // 원본시트가 "공통"이 아니어도 AI가 반드시 어느 호기인지 확인해야 함.
-    const modelFacilityMap = {}; // key: 원본시트|||정규화모델명 -> Set<표준설비명>
-    inventoryData.forEach(d => {
-      if (d.원본시트 === '공통') return;
-      const normModel = String(d.모델명 || '').replace(/\s+/g, '').toLowerCase();
-      if (!normModel) return;
-      const key = `${d.원본시트}|||${normModel}`;
-      const fac = String(d.표준설비명 || d.적용설비 || '').replace(/[\r\n]+/g, ' ').trim();
-      if (!fac) return;
-      (modelFacilityMap[key] = modelFacilityMap[key] || new Set()).add(fac);
-    });
-    const getAmbiguousFacilities = (원본시트, 모델명) => {
-      const normModel = String(모델명 || '').replace(/\s+/g, '').toLowerCase();
-      const facSet = modelFacilityMap[`${원본시트}|||${normModel}`];
-      return facSet && facSet.size > 1 ? [...facSet].sort() : null;
-    };
-
-    // ── 수정4: 재고 현황에 핵심 정보 모두 포함 ──
+    // ── 수정4: 재고 현황에 핵심 정보 모두 포함 — 설비확인필요 여부와 후보 목록을 그대로 노출 ──
     const inventoryTable = inventoryData.map(item => {
-      const isCommon = item.원본시트 === '공통';
       const stockStatus = item.최소보유수량 > 0 && item.현재수량 <= item.최소보유수량 ? '⚠️부족' : '정상';
-      const facilityLabel = isCommon
-        ? `공통시트(분류:${item.적용설비})`
-        : (item.표준설비명 || item.적용설비);
-      return `원본시트:${item.원본시트} | 설비:${facilityLabel} | 모델명:${item.모델명} | 부품종류:${item.부품종류} | 현재수량:${item.현재수량} | 최소보유:${item.최소보유수량} | 재고:${stockStatus}`;
+      const confirmNote = item.isCommonPart
+        ? ` | [설비확인필요] 후보:${(item.후보설비목록 || []).join('/')}`
+        : ` | [설비확정:${item.표준설비명}]`;
+      return `모델명:${item.모델명} | 부품종류:${item.부품종류}${confirmNote} | 현재수량:${item.현재수량} | 최소보유:${item.최소보유수량} | 재고:${stockStatus}`;
     }).join('\n');
 
     // ── 수정3: system_instruction 파라미터로 분리 ──
@@ -1122,51 +1048,41 @@ app.post('/api/ai/chat', async (req, res) => {
 반드시 아래 [최신 재고 현황]만을 근거로 답변하고, 목록에 없는 부품은 없다고 명확히 말하세요.
 
 [최신 재고 현황]
+각 줄은 하나의 부품입니다. "[설비확인필요]"가 붙은 부품은 여러 설비에서 공용으로 쓰는
+부품이라 어느 설비에 사용/입고하는지 반드시 확인해야 하고, 그 뒤 "후보:" 목록이
+선택 가능한 설비 목록입니다. "[설비확정:설비명]"이 붙은 부품은 이미 특정 설비 전용이라
+추가로 물어볼 필요가 없습니다.
 ${inventoryTable}
 
-[공통 시트 부품 목록 — 여러 설비 공용 부품]
-${commonItemsList}
-
-[등록된 실제 설비 목록 — 공통부품 출고 시 설비 선택 참고]
+[전체 설비 목록 — 참고용]
 ${realFacilities.join(', ')}
 
 [절대 준수 규칙]
-1. 입출고 처리 시 반드시 "원본시트(충전/타정/공통)" 값을 JSON에 포함할 것.
-2. 마크다운 코드블록(\`\`\`json) 절대 금지. 반드시 ~~~ 기호만 사용.
-3. 한 번에 50개 이상 변동 요청 시 두 번 재확인할 것.
-4. 모델명 매칭 시 공백·대소문자 차이는 무시하고 찾을 것.
-5. 재고 현황에 없는 부품은 "등록된 부품이 아닙니다"라고 명확히 답할 것.
+1. 마크다운 코드블록(\`\`\`json) 절대 금지. 반드시 ~~~ 기호만 사용.
+2. 한 번에 50개 이상 변동 요청 시 두 번 재확인할 것.
+3. 모델명 매칭 시 공백·대소문자 차이는 무시하고 찾을 것.
+4. 재고 현황에 없는 부품은 "등록된 부품이 아닙니다"라고 명확히 답할 것.
 
-[공통 시트 부품 출고 규칙 — 예외 없음]
-6. 원본시트가 "공통"인 부품 출고 시, 사용자가 설비명을 명시하지 않았다면
-   절대로 INVENTORY_UPDATE 명령 생성 금지. 반드시 먼저 질문:
-   "어느 설비에 사용하실 예정인가요? (예: ${realFacilities.slice(0, 3).join(' / ')})"
-7. 설비명 확인 후에만 실제사용설비 필드를 포함하여 명령 생성.
-8. "그냥 출고", "확인 생략" 요청에도 공통 부품이면 설비 확인 절대 생략 금지.
+[설비 확인 규칙 — 예외 없음]
+5. 재고 현황에서 해당 부품이 "[설비확인필요]"로 표시되어 있으면, 사용자가 이미
+   메시지에서 구체적 설비(호기)를 명시하지 않은 이상 절대로 INVENTORY_UPDATE 명령을
+   생성하지 말고, 반드시 먼저 "어느 설비에 사용/입고하셨나요? (해당 부품의 "후보:" 목록 중에서
+   실제 후보들을 예시로 제시)"라고 물어볼 것.
+6. 사용자가 설비를 답하면(또는 이미 메시지에 명시했다면), 그 설비명이 해당 부품의
+   "후보:" 목록에 있는 정확한 표기와 일치하도록 확인 후 실제사용설비 필드에 포함하여 명령 생성.
+7. "[설비확정:설비명]" 부품은 이미 설비가 하나로 확정되어 있으므로 실제사용설비를
+   묻지 않고 바로 명령을 생성해도 된다.
+8. "그냥 출고", "확인 생략" 요청에도 "[설비확인필요]" 부품이면 설비 확인 절대 생략 금지.
 
-[충전/타정 시트 — 동일 모델명이 여러 호기에 걸쳐 있는 경우 — 예외 없음]
-9. "충전"/"타정" 시트여도, 같은 모델명이 [최신 재고 현황]에 서로 다른 설비(호기)로
-   2개 이상 등록되어 있으면(예: 마블충전기#3, 마블충전기#4에 같은 모델명이 있는 경우)
-   반드시 "어느 호기(설비)에 사용/입고하셨나요? (예: 마블충전기#3 (1공장) / 마블충전기#4 (1공장))"
-   라고 먼저 물어보고, 사용자가 답한 후에만 실제사용설비 필드에 정확한 설비명을 포함하여 명령 생성.
-   설비명이 확인되지 않으면 절대로 INVENTORY_UPDATE 명령을 생성하지 말 것.
-10. 사용자가 이미 메시지에 구체적 호기(예: "마블#4", "마블충전기 4호기")를 명시했다면
-    다시 묻지 말고 [최신 재고 현황]에서 그에 해당하는 정확한 표준설비명을 찾아 실제사용설비에 포함할 것.
-
-[응답 형식 — 충전/타정 시트 일반 부품(단일 설비, 모델명이 한 설비에만 존재)]
+[응답 형식 — 설비확정 부품(설비확인 불필요)]
 설명 후 마지막에:
 ~~~INVENTORY_UPDATE
-{"action": "출고", "items": [{"모델명": "정확한모델명", "수량": 1, "원본시트": "충전"}]}
+{"action": "출고", "items": [{"모델명": "정확한모델명", "수량": 1}]}
 ~~~
 
-[응답 형식 — 충전/타정 시트, 동일 모델명이 여러 호기에 걸쳐 있어 호기 확인 완료된 경우]
+[응답 형식 — 설비확인필요 부품(설비 확인 완료 후)]
 ~~~INVENTORY_UPDATE
-{"action": "출고", "items": [{"모델명": "정확한모델명", "수량": 1, "원본시트": "충전", "실제사용설비": "마블충전기#4 (1공장)"}]}
-~~~
-
-[응답 형식 — 공통 시트 부품 (설비 확인 완료 후)]
-~~~INVENTORY_UPDATE
-{"action": "출고", "items": [{"모델명": "정확한모델명", "수량": 1, "원본시트": "공통", "실제사용설비": "확인된설비명"}]}
+{"action": "출고", "items": [{"모델명": "정확한모델명", "수량": 1, "실제사용설비": "확인된정확한설비명"}]}
 ~~~`;
 
     // 대화 이력만 contents에, systemInstruction은 별도 파라미터로
@@ -1195,36 +1111,35 @@ ${realFacilities.join(', ')}
         const updateData = JSON.parse(jsonPart);
         const { action, items } = updateData;
 
-        // ── 백엔드 안전망: 설비 특정이 안 된 채로 재고를 건드리는 것을 강제 차단 ──
-        // 1) 공통 시트 부품: 실제사용설비 없으면 차단 (기존 로직)
-        // 2) 충전/타정 시트: 동일 모델명이 여러 호기(설비)에 걸쳐 있는데 실제사용설비 없으면 차단 (신규)
+        // 모델명(공백/대소문자 무시) 기준으로 후보 항목 찾는 헬퍼
+        const findCandidates = (모델명) => {
+          const normModel = String(모델명 || '').replace(/\s+/g, '').toLowerCase();
+          return inventoryData.filter(d => String(d.모델명 || '').replace(/\s+/g, '').toLowerCase() === normModel);
+        };
+
+        // ── 백엔드 안전망: 설비 확인이 필요한 부품(isCommonPart)인데 실제사용설비가 없으면 강제 차단 ──
         {
           const missingFacilityItems = items.filter(item => {
             if (item.실제사용설비 && item.실제사용설비.trim()) return false; // 이미 명시됨
-            if (item.원본시트 === '공통') return true; // 공통 시트는 항상 필수
-            // 충전/타정: 모델명이 여러 설비에 걸쳐 있는지 확인
-            return !!getAmbiguousFacilities(item.원본시트, item.모델명);
+            const candidates = findCandidates(item.모델명);
+            return candidates.some(c => c.isCommonPart);
           });
 
           if (missingFacilityItems.length > 0) {
-            // 설비명 없이 처리 시도 차단 — 재고 변경 없이 질문만 반환
             const lines = missingFacilityItems.map(i => {
-              if (i.원본시트 === '공통') return `· ${i.모델명} (공통 부품)`;
-              const facs = getAmbiguousFacilities(i.원본시트, i.모델명);
-              return `· ${i.모델명} → 해당 설비: ${facs.join(' / ')}`;
+              const candidates = findCandidates(i.모델명);
+              const match = candidates.find(c => c.isCommonPart) || candidates[0];
+              const facs = match?.후보설비목록 || [];
+              return `· ${i.모델명} → 후보 설비: ${facs.join(' / ')}`;
             });
-            const clarifyMsg = `⚠️ 어느 설비(호기)에서 사용/입고하신 건지 확인이 필요합니다.\n${lines.join('\n')}\n\n정확한 설비명을 말씀해 주세요.`;
+            const clarifyMsg = `⚠️ 어느 설비에서 사용/입고하신 건지 확인이 필요합니다.\n${lines.join('\n')}\n\n정확한 설비명을 말씀해 주세요.`;
             console.log(`🚫 설비 미확인 차단: ${missingFacilityItems.map(i => i.모델명).join(', ')}`);
             return res.json({ success: true, message: clarifyMsg, inventoryUpdated: false, updateResult: null, timestamp: new Date().toISOString() });
           }
         }
 
         for (const item of items) {
-          const normModel = String(item.모델명 || '').replace(/\s+/g, '').toLowerCase();
-          const candidates = inventoryData.filter(d =>
-            String(d.모델명 || '').replace(/\s+/g, '').toLowerCase() === normModel &&
-            d.원본시트 === item.원본시트
-          );
+          const candidates = findCandidates(item.모델명);
 
           let targetItem = null;
           if (candidates.length === 1) {
@@ -1233,10 +1148,8 @@ ${realFacilities.join(', ')}
             // 여러 후보 중 실제사용설비로 정확히 특정
             const facRaw = String(item.실제사용설비 || '').replace(/[\r\n]+/g, ' ').trim();
             if (facRaw) {
-              targetItem = candidates.find(d =>
-                String(d.표준설비명 || d.적용설비 || '').replace(/[\r\n]+/g, ' ').trim() === facRaw ||
-                String(d.적용설비 || '').replace(/[\r\n]+/g, ' ').trim() === facRaw
-              );
+              targetItem = candidates.find(d => Array.isArray(d.후보설비목록) && d.후보설비목록.includes(facRaw))
+                || candidates.find(d => d.표준설비명 === facRaw);
             }
             if (!targetItem) {
               // 설비를 특정하지 못하면 절대 임의의 행을 건드리지 않고 스킵 (몰빵 방지)
@@ -1252,27 +1165,12 @@ ${realFacilities.join(', ')}
             targetItem.최종수정시각 = getKSTDate();
             targetItem.작업자 = user || 'AI 어시스턴트';
 
-            // ── 재고그룹 동기화: 같은 모델명+원본시트를 가진 다른 행(다른 호기)도 함께 수량 반영 ──
-            const groupKey = targetItem.재고그룹키 || getInventoryGroupKey(targetItem);
-            if (groupKey) {
-              inventoryData.forEach(other => {
-                if (other.id === targetItem.id) return;
-                const otherKey = other.재고그룹키 || getInventoryGroupKey(other);
-                if (otherKey === groupKey) {
-                  other.현재수량 = targetItem.현재수량;
-                  other.최종수정시각 = targetItem.최종수정시각;
-                  other.작업자 = targetItem.작업자;
-                }
-              });
-            }
-
-            // 공통부품인 경우 실제사용설비를 이력에 반영
+            // 설비확인이 필요했던 부품은 실제사용설비를 이력에 기록
             const logItem = { ...targetItem };
-            if (item.실제사용설비) {
+            if (targetItem.isCommonPart && item.실제사용설비) {
               logItem.적용설비 = item.실제사용설비;
               logItem.표준설비명 = item.실제사용설비;
-              logItem.isCommonPart = true;
-              console.log(`🏭 공통부품 실제 사용 설비: ${item.실제사용설비}`);
+              console.log(`🏭 실제 사용 설비: ${item.실제사용설비}`);
             }
 
             addLog(action, logItem, finalChange, user || 'AI 어시스턴트');
