@@ -979,6 +979,54 @@ app.post('/api/inventory/common-update', async (req, res) => {
 //     (그 사이에 다른 경로로 재고가 바뀌었다면 안전하게 거부)
 //  3) 이미 되돌린 이력은 다시 되돌릴 수 없음
 // ============================================================
+// ── 롤백 핵심 로직 (수동 화면의 '되돌리기' 버튼 / AI챗봇 양쪽에서 공유) ──
+// data: fetchExcelFromOneDrive()로 가져온 재고 배열. 성공 시 이 배열을 직접
+//       수정(mutate)하고 facilityLogs/memoryLogs에서도 이력을 제거한다.
+//       호출부는 성공 시 이어서 updateExcelOnOneDrive(data)만 호출하면 된다.
+//       ⚠️ 이 함수는 절대 반대 방향의 입고/출고(addLog/addFacilityLog)를 새로
+//          만들지 않는다 — 반드시 "원본 이력 자체를 삭제"하는 방식으로만 되돌린다.
+//          (반대 거래를 새로 쌓으면 재고 수량은 맞아떨어져 보여도, 잘못 기록된
+//          원본 사용이력이 그대로 남아 사용내역이 롤백되지 않는 문제가 생긴다.)
+function rollbackLogEntry(log, data, user) {
+  // 같은 부품(모델명+부품종류)의 이력 중 가장 최근 것인지 확인
+  const relatedLogs = facilityLogs.filter(l => l.모델명 === log.모델명 && l.부품종류 === log.부품종류);
+  const latestLogForItem = relatedLogs[0]; // facilityLogs는 항상 최신순 정렬됨
+  if (!latestLogForItem || latestLogForItem.id !== log.id) {
+    return { success: false, message: '이후에 재고 변동이 있어 이 이력은 되돌릴 수 없습니다. (가장 최근 이력만 취소 가능)' };
+  }
+
+  const item = data.find(d => d.모델명 === log.모델명 && d.부품종류 === log.부품종류);
+  if (!item) {
+    return { success: false, message: '해당 부품을 현재 재고에서 찾을 수 없습니다.' };
+  }
+
+  // 현재 재고가 이 로그가 남겼던 결과값과 일치하는지 확인
+  if (Number(item.현재수량) !== Number(log.변경후수량)) {
+    return { success: false, message: '현재 재고 수량이 이력과 일치하지 않아 되돌릴 수 없습니다.' };
+  }
+
+  const restoredQty = Number(log.변경전수량);
+  const oldQuantity = item.현재수량;
+  item.현재수량 = restoredQty;
+  item.최종수정시각 = getKSTDate();
+  item.작업자 = user || 'Manual';
+
+  // ── 이력 자체를 완전히 제거 (되돌린 건은 사용내역에 아예 남지 않도록) ──
+  // 설비이력(facilityLogs)에서 제거
+  const facilityIdx = facilityLogs.findIndex(l => l.id === log.id);
+  if (facilityIdx !== -1) facilityLogs.splice(facilityIdx, 1);
+
+  // 사용내역종합(memoryLogs, addLog로 쌓이는 로그)에서도 같은 id로 저장된 짝을 제거
+  // (같은 이벤트를 남기는 addLog/addFacilityLog가 sharedLogId로 연결되어 있음)
+  const generalLogs = loadLogs();
+  const filteredGeneralLogs = generalLogs.filter(l => l.id !== log.id);
+  if (filteredGeneralLogs.length !== generalLogs.length) {
+    saveLogs(filteredGeneralLogs);
+  }
+
+  return { success: true, item, oldQuantity, restoredQty };
+}
+
 app.post('/api/inventory/rollback-log', async (req, res) => {
   try {
     const { logId, user } = req.body;
@@ -991,41 +1039,10 @@ app.post('/api/inventory/rollback-log', async (req, res) => {
       return res.status(404).json({ success: false, message: '해당 이력을 찾을 수 없습니다.' });
     }
 
-    // 같은 부품(모델명+부품종류)의 이력 중 가장 최근 것인지 확인
-    const relatedLogs = facilityLogs.filter(l => l.모델명 === log.모델명 && l.부품종류 === log.부품종류);
-    const latestLogForItem = relatedLogs[0]; // facilityLogs는 항상 최신순 정렬됨
-    if (!latestLogForItem || latestLogForItem.id !== log.id) {
-      return res.status(400).json({ success: false, message: '이후에 재고 변동이 있어 이 이력은 되돌릴 수 없습니다. (가장 최근 이력만 취소 가능)' });
-    }
-
     const data = await fetchExcelFromOneDrive();
-    const item = data.find(d => d.모델명 === log.모델명 && d.부품종류 === log.부품종류);
-    if (!item) {
-      return res.status(404).json({ success: false, message: '해당 부품을 현재 재고에서 찾을 수 없습니다.' });
-    }
-
-    // 현재 재고가 이 로그가 남겼던 결과값과 일치하는지 확인
-    if (Number(item.현재수량) !== Number(log.변경후수량)) {
-      return res.status(400).json({ success: false, message: '현재 재고 수량이 이력과 일치하지 않아 되돌릴 수 없습니다.' });
-    }
-
-    const restoredQty = Number(log.변경전수량);
-    const oldQuantity = item.현재수량;
-    item.현재수량 = restoredQty;
-    item.최종수정시각 = getKSTDate();
-    item.작업자 = user || 'Manual';
-
-    // ── 이력 자체를 완전히 제거 (되돌린 건은 사용내역에 아예 남지 않도록) ──
-    // 설비이력(facilityLogs)에서 제거
-    const facilityIdx = facilityLogs.findIndex(l => l.id === logId);
-    if (facilityIdx !== -1) facilityLogs.splice(facilityIdx, 1);
-
-    // 사용내역종합(memoryLogs, addLog로 쌓이는 로그)에서도 같은 id로 저장된 짝을 제거
-    // (같은 이벤트를 남기는 addLog/addFacilityLog가 sharedLogId로 연결되어 있음)
-    const generalLogs = loadLogs();
-    const filteredGeneralLogs = generalLogs.filter(l => l.id !== logId);
-    if (filteredGeneralLogs.length !== generalLogs.length) {
-      saveLogs(filteredGeneralLogs);
+    const result = rollbackLogEntry(log, data, user);
+    if (!result.success) {
+      return res.status(400).json(result);
     }
 
     // 재고 + (이력이 제거된) 로그 시트들을 함께 저장
@@ -1035,8 +1052,8 @@ app.post('/api/inventory/rollback-log', async (req, res) => {
     }
 
     checkAndNotifyLowStock(data);
-    console.log(`↩️ 이력 되돌리기 — ${item.모델명} (${log.action}) 취소 및 이력 삭제, 재고 ${oldQuantity} → ${restoredQty}`);
-    return res.status(200).json({ success: true, message: '되돌리기 완료', data: item });
+    console.log(`↩️ 이력 되돌리기 — ${result.item.모델명} (${log.action}) 취소 및 이력 삭제, 재고 ${result.oldQuantity} → ${result.restoredQty}`);
+    return res.status(200).json({ success: true, message: '되돌리기 완료', data: result.item });
   } catch (error) {
     console.error('❌ rollback-log 에러:', error.message);
     return res.status(500).json({ success: false, message: error.message });
@@ -1152,6 +1169,21 @@ ${realFacilities.join(', ')}
 7. 입고(재고 보충)는 설비 확인 없이 바로 처리 가능하다.
 8. "그냥 출고", "확인 생략" 요청에도 설비 확인 절대 생략 금지.
 
+[되돌리기(롤백) 요청 처리 규칙 — 예외 없음]
+9. 사용자가 "롤백해줘", "취소해줘", "되돌려줘", "방금 처리한 거 잘못했어" 등으로 직전에
+   처리한 입고/출고를 취소하고 싶어하는 경우, 절대로 반대 방향의 입고/출고를
+   INVENTORY_UPDATE로 새로 만들어서 수량만 맞추려고 하지 말 것. 그렇게 하면 재고 수량은
+   맞아 보여도 잘못 기록된 원본 사용이력이 삭제되지 않고 그대로 남는다. 되돌리기는 반드시
+   아래 10번 형식의 전용 명령(INVENTORY_ROLLBACK)만 사용해서 "원본 이력 자체를 삭제"하는
+   방식으로 처리한다.
+10. 사용자가 되돌리려는 부품의 모델명(그리고 가능하면 부품종류)이 이번 메시지나 직전
+    대화에서 명확히 특정되지 않았다면, 절대로 짐작해서 명령을 만들지 말고 먼저 "어떤
+    부품의 어떤 처리를 되돌리시겠어요? (모델명을 말씀해 주세요)"라고 되물을 것. 직전
+    대화에서 방금 자신이 처리한 항목이 명확하다면 그것을 그대로 사용해도 된다.
+11. 롤백은 "해당 부품의 가장 최근 이력 1건"만 대상이 된다는 점, 그리고 이후 다른 변동이
+    있었다면 되돌릴 수 없다는 점을 서버가 다시 한번 검증한다. 조건이 맞지 않으면 서버가
+    거부 사유를 알려주므로, 그 사유를 사용자에게 그대로 전달하면 된다.
+
 [응답 형식 — 입고]
 설명 후 마지막에:
 ~~~INVENTORY_UPDATE
@@ -1161,6 +1193,12 @@ ${realFacilities.join(', ')}
 [응답 형식 — 출고(설비 확인 완료 후)]
 ~~~INVENTORY_UPDATE
 {"action": "출고", "items": [{"모델명": "정확한모델명", "수량": 1, "실제사용설비": "확인된정확한설비명"}]}
+~~~
+
+[응답 형식 — 되돌리기(롤백)]
+설명 후 마지막에 (입고/출고 형식과 절대 함께 쓰지 말 것 — 둘 중 하나만):
+~~~INVENTORY_ROLLBACK
+{"모델명": "정확한모델명", "부품종류": "정확한부품종류(모르면 생략 가능)"}
 ~~~`;
 
     // 대화 이력만 contents에, systemInstruction은 별도 파라미터로
@@ -1210,7 +1248,50 @@ ${realFacilities.join(', ')}
     let inventoryUpdated = false;
     let updateResult = null;
 
-    if (responseText.includes('~~~INVENTORY_UPDATE')) {
+    if (responseText.includes('~~~INVENTORY_ROLLBACK')) {
+      // ── AI챗봇을 통한 되돌리기(롤백) ──
+      // ⚠️ 여기서도 반대 방향 거래를 새로 쌓지 않고, 수동 화면과 동일한
+      //    rollbackLogEntry()를 그대로 재사용해 "원본 이력 삭제" 방식으로 처리한다.
+      try {
+        const parts = responseText.split('~~~INVENTORY_ROLLBACK');
+        let jsonPart = parts[1].split('~~~')[0].trim();
+        jsonPart = jsonPart.replace(/```json|```/g, '');
+        const { 모델명, 부품종류 } = JSON.parse(jsonPart);
+
+        const normModel = String(모델명 || '').replace(/\s+/g, '').toLowerCase();
+        const normType = String(부품종류 || '').replace(/\s+/g, '').toLowerCase();
+
+        // facilityLogs는 항상 최신순 정렬 → find로 찾으면 자동으로 "가장 최근 이력"이 잡힌다.
+        const targetLog = facilityLogs.find(l => {
+          const matchModel = String(l.모델명 || '').replace(/\s+/g, '').toLowerCase() === normModel;
+          if (!matchModel) return false;
+          if (!부품종류) return true;
+          return String(l.부품종류 || '').replace(/\s+/g, '').toLowerCase() === normType;
+        });
+
+        if (!targetLog) {
+          responseText = `⚠️ "${모델명}"에 해당하는, 되돌릴 수 있는 이력을 찾을 수 없습니다. 정확한 모델명을 다시 확인해 주시겠어요?`;
+        } else {
+          const result2 = rollbackLogEntry(targetLog, inventoryData, user || 'AI 어시스턴트');
+          if (!result2.success) {
+            responseText = `⚠️ ${result2.message}`;
+          } else {
+            const success = await updateExcelOnOneDrive(inventoryData);
+            if (success) {
+              inventoryUpdated = true;
+              updateResult = { success: true, action: 'ROLLBACK', item: result2.item };
+              checkAndNotifyLowStock(inventoryData);
+              responseText = `↩️ "${result2.item.모델명}" 이력(${targetLog.action})을 되돌리고 사용내역에서 삭제했습니다. (재고 ${result2.oldQuantity}개 → ${result2.restoredQty}개)`;
+            } else {
+              responseText = '⚠️ 되돌리기 처리 중 OneDrive 업데이트에 실패했습니다.';
+            }
+          }
+        }
+      } catch (error) {
+        console.error('❌ AI 롤백 명령 처리 오류:', error.message);
+        responseText = '⚠️ 되돌리기 요청을 처리하는 중 오류가 발생했습니다.';
+      }
+    } else if (responseText.includes('~~~INVENTORY_UPDATE')) {
       try {
         const parts = responseText.split('~~~INVENTORY_UPDATE');
         let jsonPart = parts[1].split('~~~')[0].trim();
