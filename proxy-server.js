@@ -189,9 +189,9 @@ function saveLogs(logs) {
   }
 }
 
-function addLog(action, item, quantityChange, user = 'System') {
+function addLog(action, item, quantityChange, user = 'System', sharedId = null) {
   const newLog = {
-    id: uuidv4(),
+    id: sharedId || uuidv4(),
     timestampKR: getKSTDate(),
     action,
     원본시트: item.원본시트 || '미분류',
@@ -287,10 +287,10 @@ async function loadFacilityLists(workbook) {
 // ============================================================
 // 설비이력 관리
 // ============================================================
-function addFacilityLog(action, item, quantityChange, user) {
+function addFacilityLog(action, item, quantityChange, user, sharedId = null) {
   const stdEquipment = item.표준설비명 || item.적용설비;
   const entry = {
-    id: uuidv4(),
+    id: sharedId || uuidv4(),
     timestampKR: getKSTDate(),
     action,
     원본시트: item.원본시트 || '',
@@ -731,8 +731,9 @@ app.post('/api/inventory/update', async (req, res) => {
     const success = await updateExcelOnOneDrive(data);
     if (success) {
       try {
-        addLog(action || '수정', item, 현재수량 - oldQuantity, user || 'Manual');
-        addFacilityLog(action || '수정', item, 현재수량 - oldQuantity, user || 'Manual');
+        const sharedLogId = uuidv4(); // 두 로그 저장소(사용내역종합/설비이력)를 같은 id로 연결 — 되돌리기 시 함께 찾기 위함
+        addLog(action || '수정', item, 현재수량 - oldQuantity, user || 'Manual', sharedLogId);
+        addFacilityLog(action || '수정', item, 현재수량 - oldQuantity, user || 'Manual', sharedLogId);
       } catch (logErr) {
         console.error('로그 기록 중 오류(무시됨):', logErr.message);
       }
@@ -771,8 +772,9 @@ app.post('/api/inventory/manual-update', async (req, res) => {
     const success = await updateExcelOnOneDrive(data);
     if (success) {
       try {
-        addLog(action || '수정', item, qtyDelta, user || 'Manual');
-        addFacilityLog(action || '수정', item, qtyDelta, user || 'Manual');
+        const sharedLogId = uuidv4();
+        addLog(action || '수정', item, qtyDelta, user || 'Manual', sharedLogId);
+        addFacilityLog(action || '수정', item, qtyDelta, user || 'Manual', sharedLogId);
       } catch (logErr) {
         console.error('📝 로그 기록 오류(무시됨):', logErr.message);
       }
@@ -951,8 +953,9 @@ app.post('/api/inventory/common-update', async (req, res) => {
     if (success) {
       // 로그에는 정규화된 실제 설비명 기록 (엑셀 원본 표기 흔들림 방지)
       const logItem = { ...item, 적용설비: norm실제사용설비, 표준설비명: norm실제사용설비, isCommonPart: true };
-      addLog(action || '출고', logItem, 현재수량 - oldQuantity, user || 'Manual');
-      addFacilityLog(action || '출고', logItem, 현재수량 - oldQuantity, user || 'Manual');
+      const sharedLogId = uuidv4();
+      addLog(action || '출고', logItem, 현재수량 - oldQuantity, user || 'Manual', sharedLogId);
+      addFacilityLog(action || '출고', logItem, 현재수량 - oldQuantity, user || 'Manual', sharedLogId);
       checkAndNotifyLowStock(data);
       console.log(`🏭 공통부품 출고 기록 — ${item.모델명} → 실제설비: ${norm실제사용설비}`);
       return res.status(200).json({ success: true, message: '공통부품 출고 완료', data: item });
@@ -987,9 +990,6 @@ app.post('/api/inventory/rollback-log', async (req, res) => {
     if (!log) {
       return res.status(404).json({ success: false, message: '해당 이력을 찾을 수 없습니다.' });
     }
-    if (log.rolledBack) {
-      return res.status(400).json({ success: false, message: '이미 되돌리기 처리된 이력입니다.' });
-    }
 
     // 같은 부품(모델명+부품종류)의 이력 중 가장 최근 것인지 확인
     const relatedLogs = facilityLogs.filter(l => l.모델명 === log.모델명 && l.부품종류 === log.부품종류);
@@ -1015,28 +1015,27 @@ app.post('/api/inventory/rollback-log', async (req, res) => {
     item.최종수정시각 = getKSTDate();
     item.작업자 = user || 'Manual';
 
+    // ── 이력 자체를 완전히 제거 (되돌린 건은 사용내역에 아예 남지 않도록) ──
+    // 설비이력(facilityLogs)에서 제거
+    const facilityIdx = facilityLogs.findIndex(l => l.id === logId);
+    if (facilityIdx !== -1) facilityLogs.splice(facilityIdx, 1);
+
+    // 사용내역종합(memoryLogs, addLog로 쌓이는 로그)에서도 같은 id로 저장된 짝을 제거
+    // (같은 이벤트를 남기는 addLog/addFacilityLog가 sharedLogId로 연결되어 있음)
+    const generalLogs = loadLogs();
+    const filteredGeneralLogs = generalLogs.filter(l => l.id !== logId);
+    if (filteredGeneralLogs.length !== generalLogs.length) {
+      saveLogs(filteredGeneralLogs);
+    }
+
+    // 재고 + (이력이 제거된) 로그 시트들을 함께 저장
     const success = await updateExcelOnOneDrive(data);
     if (!success) {
       return res.status(500).json({ success: false, message: 'OneDrive 업데이트 실패' });
     }
 
-    // 원본 이력에 "되돌림" 표시 (버튼 재사용 방지 + 이력 목록에서 취소선 등으로 표시 가능)
-    log.rolledBack = true;
-    log.rolledBackAt = getKSTDate();
-    log.rolledBackBy = user || 'Manual';
-
-    // 되돌리기 자체도 새 이력으로 남겨 감사 추적을 유지
-    const logItem = {
-      ...item,
-      적용설비: log.원본설비명 || item.적용설비,
-      표준설비명: log.표준설비명 || item.표준설비명,
-      isCommonPart: log.isCommonPart || item.isCommonPart,
-    };
-    addLog('되돌리기', logItem, restoredQty - oldQuantity, user || 'Manual');
-    addFacilityLog('되돌리기', logItem, restoredQty - oldQuantity, user || 'Manual');
-
     checkAndNotifyLowStock(data);
-    console.log(`↩️ 이력 되돌리기 — ${item.모델명} (${log.action}) 취소, 재고 ${oldQuantity} → ${restoredQty}`);
+    console.log(`↩️ 이력 되돌리기 — ${item.모델명} (${log.action}) 취소 및 이력 삭제, 재고 ${oldQuantity} → ${restoredQty}`);
     return res.status(200).json({ success: true, message: '되돌리기 완료', data: item });
   } catch (error) {
     console.error('❌ rollback-log 에러:', error.message);
