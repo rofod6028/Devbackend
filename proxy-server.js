@@ -1043,10 +1043,40 @@ ${realFacilities.join(', ')}
     }
     contents.push({ role: 'user', parts: [{ text: message }] });
 
-    const result = await model.generateContent({
-      contents,
-      systemInstruction: { parts: [{ text: systemInstruction }] }
-    });
+    let result;
+    try {
+      result = await model.generateContent({
+        contents,
+        systemInstruction: { parts: [{ text: systemInstruction }] }
+      });
+    } catch (apiError) {
+      // Gemini API 호출 자체가 실패한 경우 (네트워크, 429/쿼터, 500 등)
+      console.error('❌ Gemini API 호출 실패:', apiError.message);
+      console.error('❌ Gemini API 에러 상세:', JSON.stringify(apiError?.response?.data || apiError?.errorDetails || apiError, null, 2).slice(0, 2000));
+      return res.status(200).json({
+        success: true,
+        message: '⚠️ AI 응답을 받아오는 중 문제가 발생했습니다. 잠시 후 다시 시도해 주세요.',
+        inventoryUpdated: false,
+        updateResult: null,
+        timestamp: new Date().toISOString()
+      });
+    }
+
+    // 응답이 안전 필터(SAFETY/RECITATION 등)에 의해 차단됐는지 먼저 확인
+    const candidate = result?.response?.candidates?.[0];
+    const finishReason = candidate?.finishReason;
+    if (!candidate || (finishReason && finishReason !== 'STOP' && finishReason !== 'MAX_TOKENS')) {
+      console.error(`🚫 Gemini 응답 차단됨 — finishReason: ${finishReason}`);
+      console.error('🚫 promptFeedback:', JSON.stringify(result?.response?.promptFeedback || {}, null, 2));
+      return res.status(200).json({
+        success: true,
+        message: '⚠️ AI가 이번 요청에는 답변을 생성하지 못했습니다. 문장을 조금 다르게 바꿔서(예: 부품명과 설비명을 한 문장에 같이) 다시 말씀해 주시겠어요?',
+        inventoryUpdated: false,
+        updateResult: null,
+        timestamp: new Date().toISOString()
+      });
+    }
+
     let responseText = result.response.text();
     let inventoryUpdated = false;
     let updateResult = null;
