@@ -1053,15 +1053,66 @@ app.post('/api/ai/chat', async (req, res) => {
     // 전체 특정 설비 목록(예시/일반 안내용)
     const realFacilities = (facilityListCache?.all || []).slice().sort();
 
+    // ============================================================
+    // ✨ 토큰 절약: 매 메시지마다 전체 재고를 통째로 보내지 않는다.
+    //    재고 품목 수가 많으면(FULL_LIST_THRESHOLD 초과) 이번 메시지+최근 대화와
+    //    관련 있어 보이는 부품과 재고부족 품목만 골라서 system instruction에 넣는다.
+    //    → Gemini free tier의 "분당 입력 토큰" 한도(250,000) 초과로 인한 429 방지.
+    //    실제 입출고 처리(findCandidates 등)는 아래에서 여전히 전체 inventoryData를
+    //    사용하므로 기능에는 영향 없다 — 여기서 줄이는 건 어디까지나 "프롬프트에 적는 목록"뿐.
+    // ============================================================
+    const normalizeForSearch = (s) => String(s || '').toLowerCase().replace(/[\s\-_]+/g, '');
+
+    const BROAD_QUERY_KEYWORDS = ['전체', '전부', '모두', '모든', '다 보여', '리스트', '목록 보여', '재고 현황', '재고현황', '부족한 부품', '부족 목록'];
+    const isBroadQuery = BROAD_QUERY_KEYWORDS.some(k => String(message || '').includes(k));
+
+    // 이번 대화에서 참고할 최근 맥락(직전 몇 턴 + 이번 메시지) — "그거 얼마나 있어?" 같은 대명사 참조에도 어느 정도 대응
+    const recentContextRaw = [...(conversationHistory || []).slice(-4).map(m => m.text), message].join(' ');
+    const contextNoSpace = normalizeForSearch(recentContextRaw);
+    const contextWords = recentContextRaw
+      .split(/[\s,.\/!?()~\-·]+/)
+      .map(w => w.trim())
+      .filter(w => w.length >= 2);
+
+    const FULL_LIST_THRESHOLD = 150; // 이 개수 이하면 굳이 필터링 안 해도 토큰 부담이 크지 않음
+
+    let itemsForPrompt;
+    let isFilteredSubset = false;
+
+    if (isBroadQuery || inventoryData.length <= FULL_LIST_THRESHOLD) {
+      itemsForPrompt = inventoryData;
+    } else {
+      const matched = inventoryData.filter(item => {
+        const model = normalizeForSearch(item.모델명);
+        const type = normalizeForSearch(item.부품종류);
+        const cat = normalizeForSearch(item.대분류);
+        if (model && contextNoSpace.includes(model)) return true; // 모델명을 그대로 붙여 쓴 경우
+        return [type, cat, model].some(f => f && f.length >= 2 && contextWords.some(w => f.includes(w)));
+      });
+
+      // 재고 부족 품목은 질문과 무관해도 중요한 경고 정보이므로 항상 포함
+      const lowStock = inventoryData.filter(item => item.최소보유수량 > 0 && item.현재수량 <= item.최소보유수량);
+
+      const combinedMap = new Map();
+      [...matched, ...lowStock].forEach(item => combinedMap.set(item.id, item));
+      itemsForPrompt = Array.from(combinedMap.values()).slice(0, 120); // 안전 상한
+      isFilteredSubset = true;
+    }
+
     // ── 모든 부품이 공통 시트 소속이며, 전체 설비 목록 중에서 실사용 설비를 확인해야 하는 구조 ──
-    const inventoryTable = inventoryData.map(item => {
+    const inventoryTable = itemsForPrompt.map(item => {
       const stockStatus = item.최소보유수량 > 0 && item.현재수량 <= item.최소보유수량 ? '⚠️부족' : '정상';
       return `모델명:${item.모델명} | 부품종류:${item.부품종류} | 현재수량:${item.현재수량} | 최소보유:${item.최소보유수량} | 재고:${stockStatus}`;
     }).join('\n');
 
+    const listNote = isFilteredSubset
+      ? `⚠️ 아래 [최신 재고 현황]은 전체 재고가 아니라, 이번 질문과 관련 있어 보이는 부품 + 재고부족 품목만 골라서 보여준 "부분 목록"이다 (전체 ${inventoryData.length}건 중 ${itemsForPrompt.length}건 표시). 이 목록에 없다고 해서 "등록된 부품이 아니다"라고 단정짓지 말 것 — 대신 정확한 모델명이나 부품종류를 다시 물어볼 것. (사용자가 "전체 목록 보여줘"처럼 다시 물으면 전체를 보여줄 수 있다고 안내할 것)`
+      : `아래 [최신 재고 현황]은 전체 재고 목록이다. 이 목록에 없는 부품은 "등록된 부품이 아닙니다"라고 명확히 답할 것.`;
+
     // ── 수정3: system_instruction 파라미터로 분리 ──
     const systemInstruction = `당신은 스마트 재고 관리 AI 어시스턴트입니다.
-반드시 아래 [최신 재고 현황]만을 근거로 답변하고, 목록에 없는 부품은 없다고 명확히 말하세요.
+반드시 아래 [최신 재고 현황]만을 근거로 답변하세요.
+${listNote}
 
 [최신 재고 현황]
 ${inventoryTable}
@@ -1081,7 +1132,7 @@ ${realFacilities.join(', ')}
 1. 마크다운 코드블록(\`\`\`json) 절대 금지. 반드시 ~~~ 기호만 사용.
 2. 한 번에 50개 이상 변동 요청 시 두 번 재확인할 것.
 3. 모델명 매칭 시 공백·대소문자 차이는 무시하고 찾을 것.
-4. 재고 현황에 없는 부품은 "등록된 부품이 아닙니다"라고 명확히 답할 것.
+4. 재고 현황에 없는 부품에 대한 판단은 위 [최신 재고 현황] 바로 위의 안내(전체 목록인지 부분 목록인지)를 따를 것.
 
 [설비 확인 규칙 — 예외 없음]
 5. 모든 부품은 여러 설비가 공용으로 쓰므로, 출고(사용) 요청 시 사용자가 이번 메시지 또는
@@ -1238,8 +1289,9 @@ ${realFacilities.join(', ')}
               console.log(`🏭 실제 사용 설비: ${item.실제사용설비}`);
             }
 
-            addLog(action, logItem, finalChange, user || 'AI 어시스턴트');
-            addFacilityLog(action, logItem, finalChange, user || 'AI 어시스턴트');
+            const sharedLogId = uuidv4(); // 사용내역종합/설비이력 두 저장소를 같은 id로 연결 (되돌리기용)
+            addLog(action, logItem, finalChange, user || 'AI 어시스턴트', sharedLogId);
+            addFacilityLog(action, logItem, finalChange, user || 'AI 어시스턴트', sharedLogId);
           }
         }
 
