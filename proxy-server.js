@@ -892,7 +892,9 @@ app.get('/api/inventory/facility-summary', async (req, res) => {
 
 app.get('/api/inventory/search', async (req, res) => {
   try {
-    const query = req.query.q ? String(req.query.q).toLowerCase() : '';
+    // ✨ 검색어 정규화: 공백/하이픈/언더스코어를 무시하고 비교 (예: "PA-12" = "PA12" = "PA 12")
+    const normalize = (s) => String(s || '').toLowerCase().replace(/[\s\-_]+/g, '');
+    const query = normalize(req.query.q);
     const data = await fetchExcelFromOneDrive();
 
     if (!Array.isArray(data)) {
@@ -901,10 +903,10 @@ app.get('/api/inventory/search', async (req, res) => {
 
     const filtered = data.filter(item => {
       if (!item) return false;
-      const model = String(item.모델명 || '').toLowerCase();
-      const type = String(item.부품종류 || '').toLowerCase();
-      const facility = String(item.적용설비 || '').toLowerCase();
-      const mainCat = String(item.대분류 || '').toLowerCase();
+      const model = normalize(item.모델명);
+      const type = normalize(item.부품종류);
+      const facility = normalize(item.적용설비);
+      const mainCat = normalize(item.대분류);
       return model.includes(query) || type.includes(query) || facility.includes(query) || mainCat.includes(query);
     });
 
