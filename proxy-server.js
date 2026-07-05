@@ -965,6 +965,85 @@ app.post('/api/inventory/common-update', async (req, res) => {
   }
 });
 
+// ============================================================
+// 이력 되돌리기(롤백) — 실수로 출고/입고 처리한 것을 취소
+// POST /api/inventory/rollback-log
+// body: { logId, user }
+// 안전장치:
+//  1) 해당 부품(모델명+부품종류) 기준으로 "가장 최근" 이력만 되돌릴 수 있음
+//     (중간 이력을 되돌리면 그 이후 이력들과 수량이 어긋나기 때문)
+//  2) 현재 재고 수량이 이 로그의 변경후수량과 정확히 일치해야만 진행
+//     (그 사이에 다른 경로로 재고가 바뀌었다면 안전하게 거부)
+//  3) 이미 되돌린 이력은 다시 되돌릴 수 없음
+// ============================================================
+app.post('/api/inventory/rollback-log', async (req, res) => {
+  try {
+    const { logId, user } = req.body;
+    if (!logId) {
+      return res.status(400).json({ success: false, message: 'logId가 필요합니다.' });
+    }
+
+    const log = facilityLogs.find(l => l.id === logId);
+    if (!log) {
+      return res.status(404).json({ success: false, message: '해당 이력을 찾을 수 없습니다.' });
+    }
+    if (log.rolledBack) {
+      return res.status(400).json({ success: false, message: '이미 되돌리기 처리된 이력입니다.' });
+    }
+
+    // 같은 부품(모델명+부품종류)의 이력 중 가장 최근 것인지 확인
+    const relatedLogs = facilityLogs.filter(l => l.모델명 === log.모델명 && l.부품종류 === log.부품종류);
+    const latestLogForItem = relatedLogs[0]; // facilityLogs는 항상 최신순 정렬됨
+    if (!latestLogForItem || latestLogForItem.id !== log.id) {
+      return res.status(400).json({ success: false, message: '이후에 재고 변동이 있어 이 이력은 되돌릴 수 없습니다. (가장 최근 이력만 취소 가능)' });
+    }
+
+    const data = await fetchExcelFromOneDrive();
+    const item = data.find(d => d.모델명 === log.모델명 && d.부품종류 === log.부품종류);
+    if (!item) {
+      return res.status(404).json({ success: false, message: '해당 부품을 현재 재고에서 찾을 수 없습니다.' });
+    }
+
+    // 현재 재고가 이 로그가 남겼던 결과값과 일치하는지 확인
+    if (Number(item.현재수량) !== Number(log.변경후수량)) {
+      return res.status(400).json({ success: false, message: '현재 재고 수량이 이력과 일치하지 않아 되돌릴 수 없습니다.' });
+    }
+
+    const restoredQty = Number(log.변경전수량);
+    const oldQuantity = item.현재수량;
+    item.현재수량 = restoredQty;
+    item.최종수정시각 = getKSTDate();
+    item.작업자 = user || 'Manual';
+
+    const success = await updateExcelOnOneDrive(data);
+    if (!success) {
+      return res.status(500).json({ success: false, message: 'OneDrive 업데이트 실패' });
+    }
+
+    // 원본 이력에 "되돌림" 표시 (버튼 재사용 방지 + 이력 목록에서 취소선 등으로 표시 가능)
+    log.rolledBack = true;
+    log.rolledBackAt = getKSTDate();
+    log.rolledBackBy = user || 'Manual';
+
+    // 되돌리기 자체도 새 이력으로 남겨 감사 추적을 유지
+    const logItem = {
+      ...item,
+      적용설비: log.원본설비명 || item.적용설비,
+      표준설비명: log.표준설비명 || item.표준설비명,
+      isCommonPart: log.isCommonPart || item.isCommonPart,
+    };
+    addLog('되돌리기', logItem, restoredQty - oldQuantity, user || 'Manual');
+    addFacilityLog('되돌리기', logItem, restoredQty - oldQuantity, user || 'Manual');
+
+    checkAndNotifyLowStock(data);
+    console.log(`↩️ 이력 되돌리기 — ${item.모델명} (${log.action}) 취소, 재고 ${oldQuantity} → ${restoredQty}`);
+    return res.status(200).json({ success: true, message: '되돌리기 완료', data: item });
+  } catch (error) {
+    console.error('❌ rollback-log 에러:', error.message);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 app.post('/api/ai/chat', async (req, res) => {
   try {
     const { message, conversationHistory, user } = req.body;
