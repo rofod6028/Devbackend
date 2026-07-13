@@ -822,6 +822,9 @@ app.get('/api/inventory/logs', (req, res) => {
     const offset   = parseInt(req.query.offset) || 0;
     const facility = req.query.facility ? String(req.query.facility) : null;
     const partType = req.query.partType ? String(req.query.partType) : null;
+    // ✨ 통합 검색어: 설비명/모델명/부품종류 어디에든 포함되면 매칭 (공백/하이픈/언더스코어 무시)
+    const normalize = (s) => String(s || '').toLowerCase().replace(/[\s\-_]+/g, '');
+    const q = req.query.q ? normalize(req.query.q) : null;
 
     if (facility) {
       logs = logs.filter(l =>
@@ -831,6 +834,14 @@ app.get('/api/inventory/logs', (req, res) => {
     }
     if (partType) {
       logs = logs.filter(l => String(l.부품종류 || '') === partType);
+    }
+    if (q) {
+      logs = logs.filter(l =>
+        normalize(l.적용설비).includes(q) ||
+        normalize(l.표준설비명).includes(q) ||
+        normalize(l.모델명).includes(q) ||
+        normalize(l.부품종류).includes(q)
+      );
     }
 
     const total = logs.length;
